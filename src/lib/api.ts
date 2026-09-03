@@ -9,6 +9,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { store, CONFIG_KEYS, isPostgresMode } from "~/lib/store";
+import { queueSubmittedCustomOrders } from "~/lib/fulfillment";
 import {
   defaultDesignName,
   describeDesign,
@@ -330,6 +331,14 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       return json(201, order);
     }
 
+    // POST /api/fulfillment/queue — push every 'submitted' custom order into
+    // the fulfillment queue. Returns {queued, queuedAt} (idempotent: orders
+    // already queued are skipped).
+    if (req.method === "POST" && pathname === "/api/fulfillment/queue") {
+      const result = await queueSubmittedCustomOrders();
+      return json(200, { queued: result.queued, queuedAt: result.queuedAt });
+    }
+
     // ---------- owner endpoints ----------
     if (pathname.startsWith("/api/owner/")) {
       // GET /api/owner/designs/<file> — serve generated designs. Order: disk
@@ -509,6 +518,11 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       // GET /api/owner/orders — every custom order.
       if (req.method === "GET" && pathname === "/api/owner/orders") {
         return json(200, await store.listCustomOrders());
+      }
+
+      // GET /api/owner/fulfillment — the fulfillment queue.
+      if (req.method === "GET" && pathname === "/api/owner/fulfillment") {
+        return json(200, await store.listFulfillmentItems());
       }
 
       return json(404, { error: "Not found" });

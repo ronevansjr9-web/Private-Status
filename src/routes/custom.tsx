@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CUSTOM_FEE_CENTS } from "~/lib/constants";
+import { getCustomPayment } from "~/lib/server";
 
 export const Route = createFileRoute("/custom")({
   component: CustomPage,
@@ -24,6 +25,14 @@ function CustomPage() {
   const [confirmed, setConfirmed] = useState<{ feeCents: number } | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Payment links + amount for the confirmation card. The garment is captured
+  // at submit time so later edits to the form can't change the payment.
+  const [pay, setPay] = useState<{
+    url: string | null;
+    printFeeOnlyUrl: string | null;
+    amountCents: number;
+    feeCents: number;
+  } | null>(null);
 
   async function handleFile(file: File) {
     setUploadError(null);
@@ -67,6 +76,14 @@ function CustomPage() {
       }
       const order = (await res.json()) as { feeCents: number };
       setConfirmed({ feeCents: order.feeCents });
+      try {
+        const payData = (await getCustomPayment({
+          data: { garment },
+        })) as { url: string | null; printFeeOnlyUrl: string | null; amountCents: number };
+        setPay({ ...payData, feeCents: order.feeCents });
+      } catch {
+        setPay(null); // confirmation still renders; payment section hides
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not submit");
     } finally {
@@ -90,10 +107,44 @@ function CustomPage() {
           </div>
           <h1 className="mt-6 text-3xl font-black tracking-tight">Order submitted</h1>
           <p className="mt-3 text-neutral-600">
-            Your custom print is in. We charge the flat custom fee of{" "}
-            <strong>{usd(confirmed.feeCents)}</strong> — payment opens when
-            checkout launches, and we&apos;ll email you at that point.
+            Your custom print is in. Complete payment below and we&apos;ll start
+            your order right away — the flat custom fee is{" "}
+            <strong>{usd(confirmed.feeCents)}</strong>.
           </p>
+          {pay?.url ? (
+            <div className="mt-8 rounded-2xl border border-neutral-200 bg-neutral-50 p-6 text-left">
+              <p className="text-xs font-bold uppercase tracking-widest text-neutral-500">
+                Pay now to start your order
+              </p>
+              <p className="mt-2 text-sm text-neutral-600">
+                {usd(pay.amountCents)} — garment plus the flat{" "}
+                {usd(pay.feeCents)} custom fee, on Stripe&apos;s secure checkout.
+              </p>
+              <a
+                href={pay.url}
+                className="mt-4 block w-full rounded-full bg-neutral-900 px-6 py-3 text-center text-sm font-semibold text-white active:bg-neutral-700"
+              >
+                Pay {usd(pay.amountCents)} and start your order
+              </a>
+              {pay.printFeeOnlyUrl && (
+                <a
+                  href={pay.printFeeOnlyUrl}
+                  className="mt-3 block text-center text-xs text-neutral-500 underline hover:text-neutral-700"
+                >
+                  Pay print fee only ({usd(pay.feeCents)})
+                </a>
+              )}
+              <p className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+                Your order is saved and marked for payment — it enters the
+                fulfillment queue as soon as checkout completes.
+              </p>
+            </div>
+          ) : (
+            <p className="mt-8 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              Checkout launching soon — we&apos;ll email {email || "you"} the
+              moment payment opens.
+            </p>
+          )}
           <Link
             to="/"
             className="mt-8 inline-block rounded-full bg-neutral-900 px-6 py-3 text-sm font-semibold text-white"

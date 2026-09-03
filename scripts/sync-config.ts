@@ -9,6 +9,10 @@
 // What it seeds (Postgres mode → td_config; file mode → data/config.json):
 //   ownerKey       ← /home/team/shared/.secrets/owner-key (if present)
 //   imagePresignUrl, imageToken ← IMAGE_UPLOAD_* env vars (if present)
+//   stripeLinks    ← data/stripe-links.json contents (the slug → garment →
+//                    priceId+url payment-link map; runtime data, not a secret —
+//                    stored as a JSON string so payments.ts can read it in
+//                    Postgres mode where the data/ file may not exist)
 //
 // Values are never printed, logged, or committed.
 
@@ -17,6 +21,7 @@ import { store, CONFIG_KEYS, isPostgresMode } from "../src/lib/store";
 import type { ConfigKey } from "../src/lib/store";
 
 const OWNER_KEY_PATH = "/home/team/shared/.secrets/owner-key";
+const STRIPE_LINKS_PATH = "data/stripe-links.json";
 
 async function readTrimmed(path: string): Promise<string | null> {
   try {
@@ -67,6 +72,29 @@ async function main() {
     } else {
       console.log(`- ${key} (no ${label} source available, skipped)`);
     }
+  }
+
+  // stripeLinks: read the JSON file and store its raw contents as one config
+  // value. Idempotent like the rest; refresh with the REFRESH_STRIPE_LINKS=1
+  // env var when the lead replaces payment links.
+  try {
+    const current = await store.getConfig(CONFIG_KEYS.stripeLinks);
+    const raw = await readFile(STRIPE_LINKS_PATH, "utf8");
+    const contents = raw.trim();
+    if (contents && (current !== contents || process.env.REFRESH_STRIPE_LINKS === "1")) {
+      await store.setConfig(CONFIG_KEYS.stripeLinks, contents);
+      if (current) {
+        console.log(`~ ${CONFIG_KEYS.stripeLinks} updated from ${STRIPE_LINKS_PATH}`);
+      } else {
+        console.log(`+ ${CONFIG_KEYS.stripeLinks} set from ${STRIPE_LINKS_PATH}`);
+      }
+    } else if (current) {
+      console.log(`= ${CONFIG_KEYS.stripeLinks} already set (matches file)`);
+    } else {
+      console.log(`- ${CONFIG_KEYS.stripeLinks} (${STRIPE_LINKS_PATH} missing or empty, skipped)`);
+    }
+  } catch {
+    console.log(`- ${CONFIG_KEYS.stripeLinks} (${STRIPE_LINKS_PATH} missing or empty, skipped)`);
   }
 
   console.log(`sync-config done — config store: ${mode}`);

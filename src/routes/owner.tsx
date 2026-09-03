@@ -39,6 +39,17 @@ interface CustomOrder {
   createdAt: string;
 }
 
+interface FulfillmentItem {
+  orderId: string;
+  type: string;
+  garment: string;
+  artworkUrl: string;
+  customerEmail: string;
+  feeCents: number;
+  status: string;
+  queuedAt: string;
+}
+
 function OwnerPage() {
   const [key, setKey] = useState<string | null>(null);
   const [keyInput, setKeyInput] = useState("");
@@ -89,6 +100,7 @@ function OwnerPage() {
           await Promise.all([
             loadProducts(ownerKey),
             loadOrders(ownerKey),
+            loadFulfillment(ownerKey),
           ]);
         }
       } catch {
@@ -103,6 +115,9 @@ function OwnerPage() {
 
   const [products, setProducts] = useState<Product[]>([]);
   const [orders, setOrders] = useState<CustomOrder[]>([]);
+  const [fulfillment, setFulfillment] = useState<FulfillmentItem[]>([]);
+  const [queuing, setQueuing] = useState(false);
+  const [queueMsg, setQueueMsg] = useState<string | null>(null);
   const [dataError, setDataError] = useState<string | null>(null);
 
   const loadProducts = useCallback(async (ownerKey: string) => {
@@ -118,6 +133,43 @@ function OwnerPage() {
     });
     if (res.ok) setOrders((await res.json()) as CustomOrder[]);
   }, []);
+
+  const loadFulfillment = useCallback(async (ownerKey: string) => {
+    const res = await fetch("/api/owner/fulfillment", {
+      headers: { "X-Owner-Key": ownerKey },
+    });
+    if (res.ok) setFulfillment((await res.json()) as FulfillmentItem[]);
+  }, []);
+
+  // Push every submitted custom order into the fulfillment queue, then
+  // refresh the panel. The endpoint is idempotent (already-queued orders are
+  // skipped), so double-clicks are harmless.
+  const queueForFulfillment = useCallback(async () => {
+    setQueuing(true);
+    setQueueMsg(null);
+    try {
+      const res = await fetch("/api/fulfillment/queue", { method: "POST" });
+      const data = (await res.json().catch(() => null)) as
+        | { queued?: number; queuedAt?: string; error?: string }
+        | null;
+      if (!res.ok) {
+        setQueueMsg(data?.error ?? `Queueing failed (${res.status}).`);
+      } else {
+        const n = data?.queued ?? 0;
+        setQueueMsg(
+          n === 0
+            ? "Nothing new to queue — all submitted orders are already queued."
+            : `Queued ${n} order${n === 1 ? "" : "s"} for fulfillment.`
+        );
+        await loadFulfillment(ownerKey);
+        await loadOrders(ownerKey);
+      }
+    } catch {
+      setQueueMsg("Could not reach the queue endpoint.");
+    } finally {
+      setQueuing(false);
+    }
+  }, [ownerKey, loadFulfillment, loadOrders]);
 
   useEffect(() => {
     if (key) void loadAll(key);
@@ -186,12 +238,20 @@ function OwnerPage() {
       ownerKey={key}
       products={products}
       orders={orders}
+      fulfillment={fulfillment}
+      queueForFulfillment={queueForFulfillment}
+      queuing={queuing}
+      queueMsg={queueMsg}
       dataError={dataError}
       setDataError={setDataError}
       onRefresh={async () => {
         setDataError(null);
         try {
-          await Promise.all([loadProducts(key), loadOrders(key)]);
+          await Promise.all([
+            loadProducts(key),
+            loadOrders(key),
+            loadFulfillment(key),
+          ]);
         } catch {
           setDataError("Could not refresh store data.");
         }
@@ -202,6 +262,8 @@ function OwnerPage() {
         setKey(null);
         setProducts([]);
         setOrders([]);
+        setFulfillment([]);
+        setQueueMsg(null);
       }}
     />
   );
@@ -211,12 +273,28 @@ function Dashboard(props: {
   ownerKey: string;
   products: Product[];
   orders: CustomOrder[];
+  fulfillment: FulfillmentItem[];
+  queueForFulfillment: () => Promise<void>;
+  queuing: boolean;
+  queueMsg: string | null;
   dataError: string | null;
   setDataError: (s: string | null) => void;
   onRefresh: () => Promise<void>;
   onLock: () => void;
 }) {
-  const { ownerKey, products, orders, dataError, setDataError, onRefresh, onLock } = props;
+  const {
+    ownerKey,
+    products,
+    orders,
+    fulfillment,
+    queueForFulfillment,
+    queuing,
+    queueMsg,
+    dataError,
+    setDataError,
+    onRefresh,
+    onLock,
+  } = props;
 
   const [tab, setTab] = useState<"text" | "image">("text");
   const [prompt, setPrompt] = useState("");
@@ -578,6 +656,86 @@ function Dashboard(props: {
                 </li>
               ))}
             </ul>
+          )}
+        </section>
+
+        {/* ---- Panel 3: fulfillment queue ---- */}
+        <section className={panel} aria-label="Fulfillment queue">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-xl font-black tracking-tight">
+              Fulfillment queue{" "}
+              <span className="ml-1 inline-flex min-w-6 items-center justify-center rounded-full bg-neutral-900 px-2 py-0.5 align-middle text-xs font-bold text-white">
+                {fulfillment.length}
+              </span>
+            </h2>
+            <button
+              onClick={() => void queueForFulfillment()}
+              disabled={queuing}
+              className="shrink-0 rounded-full bg-neutral-900 px-4 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
+            >
+              {queuing ? "Queueing…" : "Queue for fulfillment"}
+            </button>
+          </div>
+          <p className="mt-1 text-xs text-neutral-500">
+            Custom orders waiting for the print partner. Queueing is idempotent —
+            already-queued orders are skipped.
+          </p>
+          {queueMsg && (
+            <p className="mt-2 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-2 text-sm text-neutral-700">
+              {queueMsg}
+            </p>
+          )}
+          {fulfillment.length === 0 ? (
+            <p className="mt-3 text-sm text-neutral-500">
+              Queue is empty. Use the button above to push submitted custom
+              orders into fulfillment.
+            </p>
+          ) : (
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full min-w-[560px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-neutral-200 text-xs uppercase tracking-widest text-neutral-500">
+                    <th className="py-2 pr-3 font-bold">Email</th>
+                    <th className="py-2 pr-3 font-bold">Garment</th>
+                    <th className="py-2 pr-3 font-bold">Fee</th>
+                    <th className="py-2 pr-3 font-bold">Queued</th>
+                    <th className="py-2 font-bold">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {fulfillment.map((f) => {
+                    const order = orders.find((o) => o.id === f.orderId);
+                    return (
+                      <tr key={f.orderId} className="border-b border-neutral-100">
+                        <td className="max-w-40 truncate py-2 pr-3 font-medium">
+                          {f.customerEmail}
+                        </td>
+                        <td className="py-2 pr-3 capitalize">{f.garment}</td>
+                        <td className="py-2 pr-3">{usd(f.feeCents)}</td>
+                        <td className="py-2 pr-3 text-neutral-500">
+                          <span title={order ? `Submitted ${new Date(order.createdAt).toLocaleString("en-US")}` : undefined}>
+                            {new Date(f.queuedAt).toLocaleDateString("en-US", {
+                              month: "short",
+                              day: "numeric",
+                            })}
+                            ,{" "}
+                            {new Date(f.queuedAt).toLocaleTimeString("en-US", {
+                              hour: "numeric",
+                              minute: "2-digit",
+                            })}
+                          </span>
+                        </td>
+                        <td className="py-2">
+                          <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-bold text-blue-800">
+                            {f.status}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
       </div>

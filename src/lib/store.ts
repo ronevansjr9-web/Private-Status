@@ -50,6 +50,28 @@ export interface CustomOrder {
 
 export interface Settings {
   customFeeCents: number;
+  /**
+   * Optional overrides for the base garment prices used in the custom-order
+   * payment amount math (base + fee = combined custom payment link amount).
+   * Undefined => fall back to the constants.ts defaults.
+   */
+  customTeeBaseCents?: number;
+  customHoodieBaseCents?: number;
+}
+
+// ---------- fulfillment ----------
+
+export type FulfillmentStatus = "queued";
+
+export interface FulfillmentItem {
+  orderId: string;
+  type: "custom";
+  garment: Garment;
+  artworkUrl: string;
+  customerEmail: string;
+  feeCents: number;
+  status: FulfillmentStatus;
+  queuedAt: string;
 }
 
 // ---------- config store (small runtime settings that must survive a deploy) ----------
@@ -60,6 +82,7 @@ export const CONFIG_KEYS = {
   ownerKey: "ownerKey",
   imagePresignUrl: "imagePresignUrl",
   imageToken: "imageToken",
+  stripeLinks: "stripeLinks",
 } as const;
 
 export type ConfigKey = (typeof CONFIG_KEYS)[keyof typeof CONFIG_KEYS];
@@ -151,6 +174,22 @@ const fileAdapter = {
     map[key] = value;
     await writeJson("config.json", map);
   },
+  async listFulfillmentItems(): Promise<FulfillmentItem[]> {
+    return readJson<FulfillmentItem[]>("fulfillment.json", []);
+  },
+  async createFulfillmentItems(
+    items: Array<Omit<FulfillmentItem, "status" | "queuedAt">>
+  ): Promise<FulfillmentItem[]> {
+    const existing = await readJson<FulfillmentItem[]>("fulfillment.json", []);
+    const queued = items.map((item) => ({
+      ...item,
+      status: "queued" as const,
+      queuedAt: new Date().toISOString(),
+    }));
+    existing.push(...queued);
+    await writeJson("fulfillment.json", existing);
+    return queued;
+  },
 };
 
 // ---------- Postgres adapter ----------
@@ -186,6 +225,16 @@ const pgAdapter = {
       CREATE TABLE IF NOT EXISTS td_config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS td_fulfillment (
+        order_id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        garment TEXT NOT NULL,
+        artwork_url TEXT NOT NULL,
+        customer_email TEXT NOT NULL,
+        fee_cents INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        queued_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `;
     // Designs created after the td_products table may need the SVG column;
@@ -328,6 +377,41 @@ const pgAdapter = {
       ON CONFLICT (key) DO UPDATE SET value = ${JSON.stringify(settings)}::jsonb
     `;
   },
+
+  async listFulfillmentItems(): Promise<FulfillmentItem[]> {
+    await this.init();
+    const rows = await sql()`
+      SELECT order_id, type, garment, artwork_url, customer_email,
+             fee_cents, status, queued_at
+      FROM td_fulfillment ORDER BY queued_at DESC
+    `;
+    return rows.map(rowToFulfillment);
+  },
+
+  /**
+   * Insert fulfillment records for the given orders. order_id is the primary
+   * key, so re-queuing an already-queued order is a no-op for that row
+   * (ON CONFLICT DO NOTHING) — the queue endpoint is safe to re-hit.
+   */
+  async createFulfillmentItems(
+    items: Array<Omit<FulfillmentItem, "status" | "queuedAt">>
+  ): Promise<FulfillmentItem[]> {
+    await this.init();
+    const inserted: FulfillmentItem[] = [];
+    for (const item of items) {
+      const rows = await sql()`
+        INSERT INTO td_fulfillment (order_id, type, garment, artwork_url,
+                                    customer_email, fee_cents, status)
+        VALUES (${item.orderId}, ${item.type}, ${item.garment}, ${item.artworkUrl},
+                ${item.customerEmail}, ${item.feeCents}, 'queued')
+        ON CONFLICT (order_id) DO NOTHING
+        RETURNING order_id, type, garment, artwork_url, customer_email,
+                  fee_cents, status, queued_at
+      `;
+      if (rows.length) inserted.push(rowToFulfillment(rows[0]));
+    }
+    return inserted;
+  },
 };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -363,6 +447,20 @@ function rowToOrder(r: AnyRow): CustomOrder {
   };
 }
 
+function rowToFulfillment(r: AnyRow): FulfillmentItem {
+  return {
+    orderId: String(r.order_id),
+    type: "custom",
+    garment: r.garment === "hoodie" ? "hoodie" : "tee",
+    artworkUrl: String(r.artwork_url),
+    customerEmail: String(r.customer_email),
+    feeCents: Number(r.fee_cents),
+    status: "queued",
+    queuedAt:
+      r.queued_at instanceof Date ? r.queued_at.toISOString() : String(r.queued_at),
+  };
+}
+
 // ---------- one interface, chosen per call ----------
 
 export const store = {
@@ -393,4 +491,12 @@ export const store = {
   getSettings: () => (usePostgres() ? pgAdapter.getSettings() : fileAdapter.getSettings()),
   saveSettings: (s: Settings) =>
     usePostgres() ? pgAdapter.saveSettings(s) : fileAdapter.saveSettings(s),
+  listFulfillmentItems: () =>
+    usePostgres() ? pgAdapter.listFulfillmentItems() : fileAdapter.listFulfillmentItems(),
+  createFulfillmentItems: (
+    items: Array<Omit<FulfillmentItem, "status" | "queuedAt">>
+  ) =>
+    usePostgres()
+      ? pgAdapter.createFulfillmentItems(items)
+      : fileAdapter.createFulfillmentItems(items),
 };
