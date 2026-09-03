@@ -1,4 +1,4 @@
-// ThreadDrop Printful client (phase 4a — GET-only thin client).
+// ThreadDrop Printful client (phase 4a GETs + 4b order creation).
 //
 // Printful REST API v1-style paths on https://api.printful.com, bearer auth.
 // Response envelope (verified 2026-09-03 with the account key):
@@ -19,6 +19,16 @@
 //   GET /catalog/variants/{vid}  → PUBLIC; result: {variant: {id, price,
 //                                  currency, size, color: {color_name,
 //                                  color_codes}, ...}}
+//
+// Phase 4b (verified 2026-09-03 against the live store):
+//   POST /orders            → creates a DRAFT order when not confirmed; needs
+//                             the X-PF-Store-Id header (store-scoped key). Body:
+//                             {recipient, items:[{variant_id, quantity,
+//                             files:[{url}]}], external_id}
+//   POST /orders/{id}/confirm → approves the draft for fulfillment
+//   DELETE /orders/{id}     → cancels/deletes a not-yet-fulfilled order
+//   The store id itself lives in the printfulVariants config value (see
+//   resolveVariantMap) so it is data, not code — never hardcode it here.
 //
 // Key resolution order: env PRINTFUL_ACCESS_KEY → config store key
 // 'printfulApiKey'. Never logged, never sent anywhere but api.printful.com.
@@ -42,14 +52,14 @@ const BASE = "https://api.printful.com";
 export { type ShippingAddress };
 
 /**
- * Phase 4b order-creation contract (documented now, implemented in 4b —
- * verified against Printful docs; do NOT ship until 4b confirms with a
- * sandbox order):
+ * Phase 4b order-creation contract (implemented below in createStoreOrder;
+ * verified against Printful docs and live in 4b):
  *
  * ORDER_SHAPE_COMMENT — POST /orders
  *   POST {BASE}/orders
- *   Headers: Authorization: Bearer <key>, Content-Type: application/json
- *   Body (external_id optional, draft:true to hold without charging):
+ *   Headers: Authorization: Bearer <key>, Content-Type: application/json,
+ *            X-PF-Store-Id: <store id from resolveVariantMap>
+ *   Body (external_id optional, draft until /confirm):
  *   {
  *     external_id: "threaddrop-custom-<orderId>",
  *     recipient: {            // all required unless noted
@@ -70,8 +80,15 @@ export { type ShippingAddress };
  *   → listen to webhook (package 'shipment'/'order' events) → update queue row.
  */
 
-/** Runtime mapping from ThreadDrop garment → Printful catalog variant. */
+/**
+ * Runtime mapping from ThreadDrop garment → Printful catalog variant, plus the
+ * Printful store the orders target. The store id rides along in this map so it
+ * is deployment data (config key 'printfulVariants' / data file), not code.
+ * It must be absent (null) when unset — never hardcode a store id here.
+ */
 export interface PrintfulVariantMap {
+  /** Printful store id that orders are placed against (X-PF-Store-Id). */
+  storeId: number | null;
   tee: { variantId: number; catalogProductId: number } | null;
   hoodie: { variantId: number; catalogProductId: number } | null;
 }
@@ -81,6 +98,7 @@ export interface PrintfulVariantMap {
 const VARIANTS_FILE = join(process.cwd(), "data", "printful-variants.json");
 
 const KNOWN_VARIANTS: PrintfulVariantMap = {
+  storeId: null,
   tee: { variantId: 4017, catalogProductId: 71 },
   hoodie: { variantId: 5531, catalogProductId: 146 },
 };
@@ -99,20 +117,44 @@ export async function resolveKey(): Promise<string | null> {
 }
 
 /**
- * Thin GET helper. Never logs or embeds the key anywhere but the auth header.
- * Returns the parsed envelope; throws Error("Printful <status>: <reason>")
- * on non-2xx so callers can surface a clean message.
+ * Thin request helper. Never logs or embeds the key anywhere but the auth
+ * header. Returns the parsed envelope; throws Error("Printful <status>:
+ * <reason>") on non-2xx so callers can surface a clean message. When the
+ * variant map carries a storeId, order endpoints get the X-PF-Store-Id header
+ * (required for store-scoped calls like POST /orders).
  */
-async function pf(path: string, init?: { method?: string }): Promise<unknown> {
+interface PfInit {
+  method?: string;
+  /** JSON body (object) — serialized here so callers never build strings. */
+  body?: unknown;
+  /** Send the X-PF-Store-Id header from the configured variant-map storeId. */
+  withStore?: boolean;
+}
+
+async function pf(path: string, init?: PfInit): Promise<unknown> {
   const key = await resolveKey();
   if (!key) {
     throw new Error("Printful API key is not configured");
   }
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${key}`,
+  };
+  if (init?.body !== undefined) {
+    headers["content-type"] = "application/json";
+  }
+  if (init?.withStore) {
+    const map = await resolveVariantMap();
+    if (map.storeId == null) {
+      throw new Error(
+        "Printful store id is not configured (printfulVariants.storeId)"
+      );
+    }
+    headers["X-PF-Store-Id"] = String(map.storeId);
+  }
   const res = await fetch(`${BASE}${path}`, {
     method: init?.method ?? "GET",
-    headers: {
-      Authorization: `Bearer ${key}`,
-    },
+    headers,
+    ...(init?.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
   });
   const body = (await res.json().catch(() => null)) as
     | { code?: number; result?: unknown; error?: { reason?: string; message?: string } }
@@ -126,12 +168,101 @@ async function pf(path: string, init?: { method?: string }): Promise<unknown> {
 
 /** Sync products in the connected Printful store (needs a bound store). */
 export async function listSyncProducts(): Promise<unknown> {
-  return pf("/store/products");
+  return pf("/store/products", { withStore: true });
 }
 
 /** Sync product detail with its variants (needs a bound store). */
 export async function getSyncProduct(id: number): Promise<unknown> {
-  return pf(`/store/products/${id}`);
+  return pf(`/store/products/${id}`, { withStore: true });
+}
+
+// ---------- phase 4b: order creation ----------
+
+/** Result of a successful createStoreOrder call. */
+export interface PrintfulOrderResult {
+  printfulOrderId: number;
+  /** Printful order status right after confirm (e.g. "pending"). */
+  status: string;
+}
+
+export interface CreateStoreOrderInput {
+  /** The fulfillment row / order id — becomes the external_id trace. */
+  orderId: string;
+  garment: "tee" | "hoodie";
+  /** Public artwork URL Printful will print (CloudFront). */
+  artworkUrl: string;
+  /** Verified recipient address; toPrintfulRecipient formats it. */
+  shipping: ShippingAddress;
+}
+
+/**
+ * Create + confirm a real order in the configured Printful store.
+ *
+ * Two calls, no mock mode:
+ *   1. POST /orders          (X-PF-Store-Id) → draft order, unconfirmed
+ *   2. POST /orders/{id}/confirm (X-PF-Store-Id) → approved for fulfillment
+ *
+ * Throws Error("Printful <status>: <message>") on any Printful failure — the
+ * caller (owner endpoint) surfaces that with its status code. If the confirm
+ * call fails, the draft order ALREADY exists at Printful; the error message
+ * carries the printfulOrderId so the owner can see/cancel it in Printful's
+ * dashboard rather than silently double-ordering on a retry.
+ */
+export async function createStoreOrder(
+  input: CreateStoreOrderInput
+): Promise<PrintfulOrderResult> {
+  const map = await resolveVariantMap();
+  if (map.storeId == null) {
+    throw new Error(
+      "Printful store id is not configured (printfulVariants.storeId)"
+    );
+  }
+  const garmentMap = map[input.garment];
+  if (!garmentMap) {
+    throw new Error(`No Printful variant mapping for garment "${input.garment}"`);
+  }
+
+  const body = {
+    external_id: `threaddrop-custom-${input.orderId}`,
+    recipient: toPrintfulRecipient(input.shipping),
+    items: [
+      {
+        variant_id: garmentMap.variantId,
+        quantity: 1,
+        files: [{ url: input.artworkUrl }],
+      },
+    ],
+  };
+
+  // 1. Draft (unconfirmed) order.
+  const draft = (await pf("/orders", {
+    method: "POST",
+    body,
+    withStore: true,
+  })) as { id?: number; status?: string } | null;
+  const printfulOrderId = draft?.id;
+  if (typeof printfulOrderId !== "number") {
+    throw new Error("Printful order creation returned no order id");
+  }
+
+  // 2. Confirm it for fulfillment.
+  try {
+    const confirmed = (await pf(`/orders/${printfulOrderId}/confirm`, {
+      method: "POST",
+      body: {},
+      withStore: true,
+    })) as { status?: string } | null;
+    return {
+      printfulOrderId,
+      status: typeof confirmed?.status === "string" ? confirmed.status : "pending",
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `${msg} (draft order ${printfulOrderId} was created but NOT confirmed — ` +
+        `check it in Printful before retrying to avoid a double order)`
+    );
+  }
 }
 
 /**
@@ -159,13 +290,19 @@ export async function resolveVariantMap(): Promise<PrintfulVariantMap> {
 function parseVariantMap(raw: string | null): PrintfulVariantMap | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as PrintfulVariantMap;
+    const parsed = JSON.parse(raw) as Partial<PrintfulVariantMap>;
     if (
       parsed &&
       typeof parsed === "object" &&
       ("tee" in parsed || "hoodie" in parsed)
     ) {
-      return parsed;
+      // storeId is optional (maps written before the store existed); keep it
+      // as a number when present, null otherwise.
+      const storeId =
+        typeof parsed.storeId === "number" && Number.isFinite(parsed.storeId)
+          ? parsed.storeId
+          : null;
+      return { ...parsed, storeId } as PrintfulVariantMap;
     }
   } catch {
     // fall through

@@ -63,6 +63,11 @@ interface FulfillmentItem {
   feeCents: number;
   status: string;
   queuedAt: string;
+  printful?: {
+    printfulOrderId: number;
+    printfulStatus: string;
+    fulfilledAt: string;
+  };
 }
 
 function OwnerPage() {
@@ -160,6 +165,7 @@ function OwnerPage() {
   // refresh the panel. The endpoint is idempotent (already-queued orders are
   // skipped), so double-clicks are harmless.
   const queueForFulfillment = useCallback(async () => {
+    if (!key) return;
     setQueuing(true);
     setQueueMsg(null);
     try {
@@ -176,15 +182,22 @@ function OwnerPage() {
             ? "Nothing new to queue — all submitted orders are already queued."
             : `Queued ${n} order${n === 1 ? "" : "s"} for fulfillment.`
         );
-        await loadFulfillment(ownerKey);
-        await loadOrders(ownerKey);
+        await loadFulfillment(key);
+        await loadOrders(key);
       }
     } catch {
       setQueueMsg("Could not reach the queue endpoint.");
     } finally {
       setQueuing(false);
     }
-  }, [ownerKey, loadFulfillment, loadOrders]);
+  }, [key, loadFulfillment, loadOrders]);
+
+  /** Replace one fulfillment row in state (used by the Printful button). */
+  const updateFulfillmentItem = useCallback((updated: FulfillmentItem) => {
+    setFulfillment((prev) =>
+      prev.map((it) => (it.orderId === updated.orderId ? updated : it))
+    );
+  }, []);
 
   useEffect(() => {
     if (key) void loadAll(key);
@@ -280,6 +293,7 @@ function OwnerPage() {
         setFulfillment([]);
         setQueueMsg(null);
       }}
+      updateFulfillmentItem={updateFulfillmentItem}
     />
   );
 }
@@ -296,6 +310,7 @@ function Dashboard(props: {
   setDataError: (s: string | null) => void;
   onRefresh: () => Promise<void>;
   onLock: () => void;
+  updateFulfillmentItem: (updated: FulfillmentItem) => void;
 }) {
   const {
     ownerKey,
@@ -309,6 +324,7 @@ function Dashboard(props: {
     setDataError,
     onRefresh,
     onLock,
+    updateFulfillmentItem,
   } = props;
 
   const [tab, setTab] = useState<"text" | "image">("text");
@@ -324,6 +340,58 @@ function Dashboard(props: {
   const [created, setCreated] = useState<Product | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // One-click Printful fulfillment state (keyed by orderId so only the
+  // affected row shows the inline error / busy state).
+  const [pfBusy, setPfBusy] = useState<string | null>(null);
+  const [pfError, setPfError] = useState<string | null>(null);
+  const [pfErrorMsg, setPfErrorMsg] = useState<string | null>(null);
+
+  const fulfillViaPrintful = useCallback(
+    async (orderId: string) => {
+      // Real order ahead — require an explicit confirmation click first.
+      if (
+        !window.confirm(
+          "Create a real print order at Printful?"
+        )
+      ) {
+        return;
+      }
+      setPfBusy(orderId);
+      setPfError(orderId);
+      setPfErrorMsg(null);
+      try {
+        const res = await fetch(
+          `/api/owner/fulfillment/${orderId}/printful`,
+          {
+            method: "POST",
+            headers: { "X-Owner-Key": ownerKey },
+          }
+        );
+        const data = (await res.json().catch(() => null)) as
+          | { item?: FulfillmentItem; error?: string }
+          | null;
+        if (!res.ok) {
+          // Surface Printful's own error message inline on the row.
+          setPfErrorMsg(
+            data?.error ?? `Printful fulfillment failed (${res.status}).`
+          );
+          return;
+        }
+        const updated = data?.item;
+        if (updated) {
+          updateFulfillmentItem(updated);
+        }
+        setPfError(null);
+        setPfErrorMsg(null);
+      } catch {
+        setPfErrorMsg("Could not reach the fulfillment endpoint.");
+      } finally {
+        setPfBusy(null);
+      }
+    },
+    [ownerKey, updateFulfillmentItem]
+  );
 
   async function handleFile(file: File) {
     setError(null);
@@ -694,7 +762,7 @@ function Dashboard(props: {
           <p className="mt-1 text-xs text-neutral-500">
             Custom orders waiting for the print partner. Queueing is idempotent —
             already-queued orders are skipped. &ldquo;Fulfill via Printful&rdquo;
-            goes live in phase 4b.
+            creates a real print order (confirm before clicking).
           </p>
           {queueMsg && (
             <p className="mt-2 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-2 text-sm text-neutral-700">
@@ -724,6 +792,8 @@ function Dashboard(props: {
                   {fulfillment.map((f) => {
                     const order = orders.find((o) => o.id === f.orderId);
                     const shipTo = shipToLine(order);
+                    const hasAddress = Boolean(order?.shipping);
+                    const sent = f.status === "sent_to_printful" && f.printful;
                     return (
                       <tr key={f.orderId} className="border-b border-neutral-100">
                         <td className="max-w-40 truncate py-2 pr-3 font-medium">
@@ -751,18 +821,55 @@ function Dashboard(props: {
                           </span>
                         </td>
                         <td className="py-2 pr-3">
-                          <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-bold text-blue-800">
-                            {f.status}
-                          </span>
+                          {sent ? (
+                            <span className="rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-bold text-green-800">
+                              sent_to_printful
+                            </span>
+                          ) : (
+                            <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-bold text-blue-800">
+                              {f.status}
+                            </span>
+                          )}
+                          {sent && (
+                            <p className="mt-1 text-xs text-neutral-500">
+                              Printful #{f.printful?.printfulOrderId} ·{" "}
+                              {f.printful?.printfulStatus}
+                            </p>
+                          )}
                         </td>
                         <td className="py-2">
-                          <span
-                            title="Phase 4b: one click after Printful mapping confirmed"
-                            className="cursor-not-allowed rounded-full border border-neutral-300 bg-neutral-100 px-3 py-1.5 text-xs font-semibold text-neutral-400 select-none"
-                            aria-disabled="true"
-                          >
-                            Fulfill via Printful
-                          </span>
+                          {sent ? (
+                            <span className="text-xs text-neutral-400 select-none">
+                              Order #{f.printful?.printfulOrderId} at Printful
+                            </span>
+                          ) : hasAddress ? (
+                            <div className="space-y-1">
+                              <button
+                                onClick={() =>
+                                  void fulfillViaPrintful(f.orderId)
+                                }
+                                disabled={pfBusy === f.orderId}
+                                className="rounded-full bg-neutral-900 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
+                              >
+                                {pfBusy === f.orderId
+                                  ? "Sending…"
+                                  : "Fulfill via Printful"}
+                              </button>
+                              {pfError === f.orderId && pfErrorMsg && (
+                                <p className="max-w-52 text-xs leading-snug text-red-600">
+                                  {pfErrorMsg}
+                                </p>
+                              )}
+                            </div>
+                          ) : (
+                            <span
+                              title="Add a shipping address to this order first (fulfilling needs a recipient)"
+                              className="cursor-not-allowed rounded-full border border-neutral-300 bg-neutral-100 px-3 py-1.5 text-xs font-semibold text-neutral-400 select-none"
+                              aria-disabled="true"
+                            >
+                              Fulfill via Printful
+                            </span>
+                          )}
                         </td>
                       </tr>
                     );

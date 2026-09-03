@@ -10,7 +10,11 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { store, CONFIG_KEYS, isPostgresMode, type ShippingAddress } from "~/lib/store";
 import { queueSubmittedCustomOrders } from "~/lib/fulfillment";
-import { resolveKey, resolveVariantMap } from "~/lib/printful";
+import {
+  createStoreOrder,
+  resolveKey,
+  resolveVariantMap,
+} from "~/lib/printful";
 import {
   defaultDesignName,
   describeDesign,
@@ -582,10 +586,11 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
         return json(200, await store.listFulfillmentItems());
       }
 
-      // GET /api/owner/printful — phase 4a status probe for the dashboard.
-      // Reports resolvability of the key and the variant mapping, plus
-      // store connectivity as HTTP status ONLY (never the key, never full
-      // response bodies). 502 when the API is unreachable or errors.
+      // GET /api/owner/printful — Printful status probe for the dashboard.
+      // Reports resolvability of the key and the variant mapping (incl. the
+      // configured store id), plus store connectivity as HTTP status ONLY
+      // (never the key, never full response bodies). 502 when the API is
+      // unreachable or errors.
       if (req.method === "GET" && pathname === "/api/owner/printful") {
         const key = await resolveKey();
         const keySet = Boolean(key);
@@ -603,11 +608,86 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
         }
         return json(200, {
           keySet,
+          storeId: variants.storeId,
           variants,
           storeStatus,
-          phase: "4a",
-          orderCreation: "phase 4b",
+          phase: "4b",
+          orderCreation: "live",
         });
+      }
+
+      // POST /api/owner/fulfillment/<orderId>/printful — phase 4b one-click
+      // fulfillment. Creates a REAL order at Printful (draft + confirm) for
+      // the fulfillment row's custom order. Guards, in order:
+      //   404 no such fulfillment row · 200 idempotent no-op when already
+      //   sent · 422 when the underlying custom order lacks a shipping
+      //   address or artwork URL (checked BEFORE any Printful call) ·
+      //   Printful errors surface as {error} with Printful's status code.
+      if (req.method === "POST" && pathname.startsWith("/api/owner/fulfillment/")) {
+        const m = /^\/api\/owner\/fulfillment\/([a-z0-9_]+)\/printful$/.exec(pathname);
+        if (!m) return json(404, { error: "Not found" });
+        const orderId = m[1];
+
+        const item = await store.getFulfillmentItem(orderId);
+        if (!item) {
+          return json(404, { error: "No fulfillment item for that order" });
+        }
+
+        // Idempotency guard: never create a second Printful order for a row
+        // that already went out. Report the recorded state instead.
+        if (item.status === "sent_to_printful" && item.printful) {
+          return json(200, {
+            ok: true,
+            idempotent: true,
+            item,
+          });
+        }
+
+        // Preconditions from the underlying custom order — verified BEFORE
+        // any Printful call so a bad row can never create a stray order.
+        const orders = await store.listCustomOrders();
+        const order = orders.find((o) => o.id === orderId);
+        if (!order) {
+          return json(422, {
+            error: "The underlying custom order no longer exists",
+          });
+        }
+        const missing: string[] = [];
+        if (!order.shipping) missing.push("shipping address");
+        if (!order.artworkUrl) missing.push("artwork URL");
+        if (missing.length > 0) {
+          return json(422, {
+            error:
+              `Cannot fulfill via Printful: the order has no ${missing.join(" and ")}. ` +
+              "Printful needs a recipient address and printable artwork.",
+          });
+        }
+
+        try {
+          const result = await createStoreOrder({
+            orderId,
+            garment: item.garment,
+            artworkUrl: order.artworkUrl,
+            shipping: order.shipping as ShippingAddress,
+          });
+          const updated = await store.updateFulfillmentStatus(orderId, {
+            status: "sent_to_printful",
+            printful: {
+              printfulOrderId: result.printfulOrderId,
+              printfulStatus: result.status,
+              fulfilledAt: new Date().toISOString(),
+            },
+          });
+          return json(200, { ok: true, idempotent: false, item: updated });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Printful request failed";
+          // Printful errors look like "Printful <status>: <message>" — keep
+          // the numeric status so the owner sees the real failure code.
+          const pfMatch = /^Printful (\d{3}):/.exec(msg);
+          return json(pfMatch ? Number(pfMatch[1]) : 502, {
+            error: msg,
+          });
+        }
       }
 
       return json(404, { error: "Not found" });

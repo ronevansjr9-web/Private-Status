@@ -75,7 +75,16 @@ export interface Settings {
 
 // ---------- fulfillment ----------
 
-export type FulfillmentStatus = "queued";
+export type FulfillmentStatus = "queued" | "sent_to_printful";
+
+/** Optional Printful trace stamped on a row when the owner fires the order. */
+export interface FulfillmentPrintfulInfo {
+  printfulOrderId: number;
+  /** Printful order status at confirm time (e.g. "pending"). */
+  printfulStatus: string;
+  /** ISO timestamp of the successful create+confirm. */
+  fulfilledAt: string;
+}
 
 export interface FulfillmentItem {
   orderId: string;
@@ -86,6 +95,8 @@ export interface FulfillmentItem {
   feeCents: number;
   status: FulfillmentStatus;
   queuedAt: string;
+  /** Present once the one-click "Fulfill via Printful" succeeded. */
+  printful?: FulfillmentPrintfulInfo;
 }
 
 // ---------- config store (small runtime settings that must survive a deploy) ----------
@@ -206,6 +217,29 @@ const fileAdapter = {
     await writeJson("fulfillment.json", existing);
     return queued;
   },
+  async updateFulfillmentStatus(
+    orderId: string,
+    update: {
+      status: FulfillmentStatus;
+      printful?: FulfillmentPrintfulInfo;
+    }
+  ): Promise<FulfillmentItem | null> {
+    const items = await readJson<FulfillmentItem[]>("fulfillment.json", []);
+    const idx = items.findIndex((i) => i.orderId === orderId);
+    if (idx === -1) return null;
+    const updated: FulfillmentItem = {
+      ...items[idx],
+      status: update.status,
+      ...(update.printful ? { printful: update.printful } : {}),
+    };
+    items[idx] = updated;
+    await writeJson("fulfillment.json", items);
+    return updated;
+  },
+  async getFulfillmentItem(orderId: string): Promise<FulfillmentItem | null> {
+    const items = await readJson<FulfillmentItem[]>("fulfillment.json", []);
+    return items.find((i) => i.orderId === orderId) ?? null;
+  },
 };
 
 // ---------- Postgres adapter ----------
@@ -268,6 +302,17 @@ async function runInit(): Promise<void> {
       status TEXT NOT NULL DEFAULT 'queued',
       queued_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
+  `;
+  // Phase 4b: printful trace columns for rows fired at the print partner.
+  // Idempotent ADD COLUMN for tables that predate it.
+  await sql()`
+    ALTER TABLE td_fulfillment ADD COLUMN IF NOT EXISTS printful_order_id INTEGER
+  `;
+  await sql()`
+    ALTER TABLE td_fulfillment ADD COLUMN IF NOT EXISTS printful_status TEXT
+  `;
+  await sql()`
+    ALTER TABLE td_fulfillment ADD COLUMN IF NOT EXISTS fulfilled_at TIMESTAMPTZ
   `;
   // Designs created after the td_products table may need the SVG column;
   // idempotent ADD COLUMN for tables that predate it.
@@ -432,7 +477,8 @@ const pgAdapter = {
     await this.init();
     const rows = await sql()`
       SELECT order_id, type, garment, artwork_url, customer_email,
-             fee_cents, status, queued_at
+             fee_cents, status, queued_at, printful_order_id,
+             printful_status, fulfilled_at
       FROM td_fulfillment ORDER BY queued_at DESC
     `;
     return rows.map(rowToFulfillment);
@@ -456,11 +502,46 @@ const pgAdapter = {
                 ${item.customerEmail}, ${item.feeCents}, 'queued')
         ON CONFLICT (order_id) DO NOTHING
         RETURNING order_id, type, garment, artwork_url, customer_email,
-                  fee_cents, status, queued_at
+                  fee_cents, status, queued_at, printful_order_id,
+                  printful_status, fulfilled_at
       `;
       if (rows.length) inserted.push(rowToFulfillment(rows[0]));
     }
     return inserted;
+  },
+
+  async getFulfillmentItem(orderId: string): Promise<FulfillmentItem | null> {
+    await this.init();
+    const rows = await sql()`
+      SELECT order_id, type, garment, artwork_url, customer_email,
+             fee_cents, status, queued_at, printful_order_id,
+             printful_status, fulfilled_at
+      FROM td_fulfillment WHERE order_id = ${orderId} LIMIT 1
+    `;
+    return rows.length ? rowToFulfillment(rows[0]) : null;
+  },
+
+  async updateFulfillmentStatus(
+    orderId: string,
+    update: {
+      status: FulfillmentStatus;
+      printful?: FulfillmentPrintfulInfo;
+    }
+  ): Promise<FulfillmentItem | null> {
+    await this.init();
+    const pf = update.printful;
+    const rows = await sql()`
+      UPDATE td_fulfillment
+      SET status = ${update.status},
+          printful_order_id = ${pf ? pf.printfulOrderId : null},
+          printful_status = ${pf ? pf.printfulStatus : null},
+          fulfilled_at = ${pf ? pf.fulfilledAt : null}::timestamptz
+      WHERE order_id = ${orderId}
+      RETURNING order_id, type, garment, artwork_url, customer_email,
+                fee_cents, status, queued_at, printful_order_id,
+                printful_status, fulfilled_at
+    `;
+    return rows.length ? rowToFulfillment(rows[0]) : null;
   },
 };
 
@@ -512,6 +593,11 @@ function rowToOrder(r: AnyRow): CustomOrder {
 }
 
 function rowToFulfillment(r: AnyRow): FulfillmentItem {
+  const printfulOrderId = r.printful_order_id;
+  const printfulStatus = r.printful_status;
+  const fulfilledAt = r.fulfilled_at;
+  const hasPrintful =
+    printfulOrderId != null && printfulStatus != null && fulfilledAt != null;
   return {
     orderId: String(r.order_id),
     type: "custom",
@@ -519,9 +605,21 @@ function rowToFulfillment(r: AnyRow): FulfillmentItem {
     artworkUrl: String(r.artwork_url),
     customerEmail: String(r.customer_email),
     feeCents: Number(r.fee_cents),
-    status: "queued",
+    status: r.status === "sent_to_printful" ? "sent_to_printful" : "queued",
     queuedAt:
       r.queued_at instanceof Date ? r.queued_at.toISOString() : String(r.queued_at),
+    ...(hasPrintful
+      ? {
+          printful: {
+            printfulOrderId: Number(printfulOrderId),
+            printfulStatus: String(printfulStatus),
+            fulfilledAt:
+              fulfilledAt instanceof Date
+                ? fulfilledAt.toISOString()
+                : String(fulfilledAt),
+          },
+        }
+      : {}),
   };
 }
 
@@ -563,4 +661,17 @@ export const store = {
     usePostgres()
       ? pgAdapter.createFulfillmentItems(items)
       : fileAdapter.createFulfillmentItems(items),
+  /** One fulfillment row by order id (null when absent). */
+  getFulfillmentItem: (orderId: string) =>
+    usePostgres()
+      ? pgAdapter.getFulfillmentItem(orderId)
+      : fileAdapter.getFulfillmentItem(orderId),
+  /** Stamp status + optional Printful trace onto a fulfillment row. */
+  updateFulfillmentStatus: (
+    orderId: string,
+    update: { status: FulfillmentStatus; printful?: FulfillmentPrintfulInfo }
+  ) =>
+    usePostgres()
+      ? pgAdapter.updateFulfillmentStatus(orderId, update)
+      : fileAdapter.updateFulfillmentStatus(orderId, update),
 };
