@@ -26,6 +26,15 @@ export interface Product {
   priceHoodieCents: number;
   status: "live";
   createdAt: string;
+  /**
+   * Generated design artwork kept in the row itself (Postgres mode only).
+   * Letting the SVG live in the DB is what makes designs created in one
+   * environment visible everywhere after a deploy — the published host has no
+   * access to files written in the sandbox. Undefined for seeded/remote-image
+   * products and for file-mode products (those keep their file on disk).
+   * Only loaded by getProductByDesignUrl, never shipped to storefront pages.
+   */
+  designSvg?: string;
 }
 
 export interface CustomOrder {
@@ -43,9 +52,24 @@ export interface Settings {
   customFeeCents: number;
 }
 
+// ---------- config store (small runtime settings that must survive a deploy) ----------
+
+// Known config keys. Secrets are stored as values, never as key names — key
+// names are safe to print; values never are.
+export const CONFIG_KEYS = {
+  ownerKey: "ownerKey",
+  imagePresignUrl: "imagePresignUrl",
+  imageToken: "imageToken",
+} as const;
+
+export type ConfigKey = (typeof CONFIG_KEYS)[keyof typeof CONFIG_KEYS];
+
 // ---------- adapter selection ----------
 
 const usePostgres = () => !!process.env.DATABASE_URL;
+
+/** True when the Postgres adapter is active (DATABASE_URL is set). */
+export const isPostgresMode = usePostgres;
 
 // ---------- JSON file adapter (site/data/, gitignored) ----------
 
@@ -117,6 +141,16 @@ const fileAdapter = {
   async saveSettings(settings: Settings): Promise<void> {
     await writeJson("settings.json", settings);
   },
+  async getConfig(key: ConfigKey): Promise<string | null> {
+    const map = await readJson<Record<string, string>>("config.json", {});
+    const v = map[key];
+    return typeof v === "string" && v ? v : null;
+  },
+  async setConfig(key: ConfigKey, value: string): Promise<void> {
+    const map = await readJson<Record<string, string>>("config.json", {});
+    map[key] = value;
+    await writeJson("config.json", map);
+  },
 };
 
 // ---------- Postgres adapter ----------
@@ -149,6 +183,15 @@ const pgAdapter = {
         key TEXT PRIMARY KEY,
         value JSONB NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS td_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `;
+    // Designs created after the td_products table may need the SVG column;
+    // idempotent ADD COLUMN for tables that predate it.
+    await sql()`
+      ALTER TABLE td_products ADD COLUMN IF NOT EXISTS design_svg TEXT
     `;
   },
 
@@ -187,6 +230,59 @@ const pgAdapter = {
                 price_tee_cents, price_hoodie_cents, status, created_at
     `;
     return rowToProduct(rows[0]);
+  },
+
+  /**
+   * Postgres variant that also stores the generated SVG in the row, so
+   * designs created in any environment render on the published host (which
+   * cannot see sandbox files). designImageUrl still points at
+   * /api/owner/designs/<slug>.svg — the GET handler transparently serves from
+   * this column when the file is absent.
+   */
+  async createProductWithSvg(
+    input: Omit<Product, "id" | "createdAt" | "status">,
+    svg: string
+  ): Promise<Product> {
+    await this.init();
+    const id = `p_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const rows = await sql()`
+      INSERT INTO td_products (id, slug, name, description, design_image_url,
+                               price_tee_cents, price_hoodie_cents, status, design_svg)
+      VALUES (${id}, ${input.slug}, ${input.name}, ${input.description},
+              ${input.designImageUrl}, ${input.priceTeeCents},
+              ${input.priceHoodieCents}, 'live', ${svg})
+      RETURNING id, slug, name, description, design_image_url,
+                price_tee_cents, price_hoodie_cents, status, created_at
+    `;
+    return rowToProduct(rows[0]);
+  },
+
+  /** Load just the design SVG for a product, by its design URL path. */
+  async getDesignSvgByUrl(designImageUrl: string): Promise<string | null> {
+    await this.init();
+    const rows = await sql()`
+      SELECT design_svg FROM td_products
+      WHERE design_image_url = ${designImageUrl} AND status = 'live' LIMIT 1
+    `;
+    const v = rows[0]?.design_svg;
+    return typeof v === "string" && v ? v : null;
+  },
+
+  async getConfig(key: ConfigKey): Promise<string | null> {
+    await this.init();
+    const rows = await sql()`
+      SELECT value FROM td_config WHERE key = ${key} LIMIT 1
+    `;
+    const v = rows[0]?.value;
+    return typeof v === "string" && v ? v : null;
+  },
+
+  async setConfig(key: ConfigKey, value: string): Promise<void> {
+    await this.init();
+    await sql()`
+      INSERT INTO td_config (key, value) VALUES (${key}, ${value})
+      ON CONFLICT (key) DO UPDATE SET value = ${value}
+    `;
   },
 
   async listCustomOrders(): Promise<CustomOrder[]> {
@@ -275,6 +371,21 @@ export const store = {
     usePostgres() ? pgAdapter.getProductBySlug(s) : fileAdapter.getProductBySlug(s),
   createProduct: (i: Omit<Product, "id" | "createdAt" | "status">) =>
     usePostgres() ? pgAdapter.createProduct(i) : fileAdapter.createProduct(i),
+  /** Postgres mode only — file mode has no row to store the SVG in. */
+  createProductWithSvg: (i: Omit<Product, "id" | "createdAt" | "status">, svg: string) =>
+    usePostgres()
+      ? pgAdapter.createProductWithSvg(i, svg)
+      : fileAdapter.createProduct(i),
+  /**
+   * Design artwork lookup by design URL path. File mode serves from disk and
+   * never needs this; in Postgres mode it reads the td_products.design_svg
+   * column. Returns null when the caller should fall back to disk.
+   */
+  getDesignSvgByUrl: (designImageUrl: string) =>
+    usePostgres() ? pgAdapter.getDesignSvgByUrl(designImageUrl) : Promise.resolve(null),
+  getConfig: (key: ConfigKey) => (usePostgres() ? pgAdapter.getConfig(key) : fileAdapter.getConfig(key)),
+  setConfig: (key: ConfigKey, value: string) =>
+    usePostgres() ? pgAdapter.setConfig(key, value) : fileAdapter.setConfig(key, value),
   listCustomOrders: () =>
     usePostgres() ? pgAdapter.listCustomOrders() : fileAdapter.listCustomOrders(),
   createCustomOrder: (i: Omit<CustomOrder, "id" | "createdAt" | "status">) =>

@@ -8,7 +8,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { store } from "~/lib/store";
+import { store, CONFIG_KEYS, isPostgresMode } from "~/lib/store";
 import {
   defaultDesignName,
   describeDesign,
@@ -48,10 +48,19 @@ const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
  *   2. PUT raw bytes to presignedUrl with content-type, content-length and
  *      x-amz-server-side-encryption: AES256 (signed header — omitting fails).
  *   3. File is publicly served at cloudfrontUrl (~1.5s to propagate).
+ *
+ * Credentials resolve in order: env IMAGE_UPLOAD_* (sandbox) → config store
+ * (data/config.json in file mode, td_config table in Postgres mode). The
+ * config store is what makes uploads work on the published host, where the
+ * env vars do not exist; scripts/sync-config.ts seeds it once. Values are
+ * never logged.
  */
 async function uploadImage(bytes: Uint8Array, contentType: string): Promise<string> {
-  const presignUrl = process.env.IMAGE_UPLOAD_PRESIGN_URL;
-  const token = process.env.IMAGE_UPLOAD_TOKEN;
+  const presignUrl =
+    process.env.IMAGE_UPLOAD_PRESIGN_URL ||
+    (await store.getConfig(CONFIG_KEYS.imagePresignUrl));
+  const token =
+    process.env.IMAGE_UPLOAD_TOKEN || (await store.getConfig(CONFIG_KEYS.imageToken));
   if (!presignUrl || !token) {
     throw new Error("Image upload service is not configured");
   }
@@ -138,12 +147,30 @@ async function readOwnerKey(): Promise<string | null> {
 }
 
 /**
+ * Owner key resolution order:
+ *   1. env OWNER_KEY (sandbox convenience / override)
+ *   2. config store (data/config.json in file mode, td_config in Postgres
+ *      mode) — this is what makes owner auth work on the published host,
+ *      where the secrets file does not exist
+ *   3. the shared secrets file at OWNER_KEY_PATH (sandbox)
+ * A missing value in ALL three => 503 (server config problem, not a wrong
+ * key). Values are never logged and never sent to the browser.
+ */
+async function resolveOwnerKey(): Promise<string | null> {
+  const envKey = process.env.OWNER_KEY;
+  if (envKey && envKey.trim()) return envKey.trim();
+  const configKey = await store.getConfig(CONFIG_KEYS.ownerKey);
+  if (configKey) return configKey;
+  return readOwnerKey();
+}
+
+/**
  * Returns an ApiResult to send immediately (401 / 503), or null when the
  * request is authenticated. Accepts the key via X-Owner-Key header, ?key=,
  * Authorization: Bearer, or JSON/form body field `key`.
  */
 async function ownerAuth(req: Request, bodyKey?: unknown): Promise<ApiResult | null> {
-  const expected = await readOwnerKey();
+  const expected = await resolveOwnerKey();
   if (!expected) {
     return json(503, { error: "owner key not configured" });
   }
@@ -305,8 +332,10 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
 
     // ---------- owner endpoints ----------
     if (pathname.startsWith("/api/owner/")) {
-      // GET /api/owner/designs/<file> — serve a generated design from disk at
-      // request time (no owner key: product images are public).
+      // GET /api/owner/designs/<file> — serve generated designs. Order: disk
+      // first (file mode and same-host case), then in Postgres mode the
+      // td_products.design_svg column — designs created on any host are stored
+      // in the DB row, so they render everywhere after a deploy.
       const designMatch = /^\/api\/owner\/designs\/([a-z0-9][a-z0-9._-]{0,80})$/.exec(
         pathname
       );
@@ -323,6 +352,15 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
             contentType,
           };
         } catch {
+          // Not on disk: try the DB (Postgres mode only; no-op in file mode).
+          const svg = await store.getDesignSvgByUrl(pathname);
+          if (svg) {
+            return {
+              status: 200,
+              body: svg,
+              contentType,
+            };
+          }
           return json(404, { error: "Not found" });
         }
       }
@@ -352,9 +390,14 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
         const teeCents = priceCents(b.priceTeeCents) ?? DEFAULT_TEE_CENTS;
         const hoodieCents = priceCents(b.priceHoodieCents) ?? DEFAULT_HOODIE_CENTS;
 
-        let designImageUrl: string;
+        let designImageUrl: string | undefined;
         let description: string;
         let name: string;
+        // SVG artwork to persist with the product row (Postgres mode). File
+        // mode keeps writing to public/designs/ and leaves this unset. The
+        // design URL in Postgres mode is derived from the FINAL slug after the
+        // collision check below (the GET handler looks the SVG up by URL).
+        let designSvg: string | null = null;
 
         if (mode === "text") {
           const prompt = typeof b.prompt === "string" ? b.prompt.trim() : "";
@@ -366,14 +409,19 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
           const out = await generateDesign(prompt);
           description = describeDesign(prompt, out.engine);
           if (out.svg) {
-            const base = slugify(name);
-            let filename = `${base}.svg`;
-            let n = 2;
-            while (await designFileTaken(filename)) {
-              filename = `${base}-${n}.svg`;
-              n++;
+            if (isPostgresMode()) {
+              designSvg = out.svg;
+            } else {
+              // File mode: write to public/designs/ as before.
+              const base = slugify(name);
+              let filename = `${base}.svg`;
+              let n = 2;
+              while (await designFileTaken(filename)) {
+                filename = `${base}-${n}.svg`;
+                n++;
+              }
+              designImageUrl = await saveDesignSvg(out.svg, filename);
             }
-            designImageUrl = await saveDesignSvg(out.svg, filename);
           } else if (out.imageUrl) {
             // Remote engine returned an image URL or data URI — store locally
             // so the product does not depend on the third-party host.
@@ -423,14 +471,33 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
           slug = `${slug}-${n}`;
         }
 
-        const product = await store.createProduct({
-          slug,
-          name,
-          description,
-          designImageUrl,
-          priceTeeCents: teeCents,
-          priceHoodieCents: hoodieCents,
-        });
+        // In Postgres text mode the SVG goes into the row, so the design URL
+        // must be derived from the FINAL slug — the GET handler looks the SVG
+        // up by this exact URL. File mode already wrote its (possibly -2
+        // suffixed) file above, and image mode set its own URL.
+        designImageUrl ??= `/api/owner/designs/${slug}.svg`;
+
+        const product =
+          designSvg !== null
+            ? await store.createProductWithSvg(
+                {
+                  slug,
+                  name,
+                  description,
+                  designImageUrl,
+                  priceTeeCents: teeCents,
+                  priceHoodieCents: hoodieCents,
+                },
+                designSvg
+              )
+            : await store.createProduct({
+                slug,
+                name,
+                description,
+                designImageUrl,
+                priceTeeCents: teeCents,
+                priceHoodieCents: hoodieCents,
+              });
         return json(201, product);
       }
 
