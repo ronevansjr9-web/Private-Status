@@ -12,12 +12,50 @@ const usd = (cents: number) =>
 
 type Garment = "tee" | "hoodie";
 
+// Compact country list for the optional shipping selector (ISO alpha-2 codes —
+// the same codes Printful's recipient.country_code expects).
+const COUNTRIES: Array<{ code: string; name: string }> = [
+  { code: "US", name: "United States" },
+  { code: "CA", name: "Canada" },
+  { code: "GB", name: "United Kingdom" },
+  { code: "AU", name: "Australia" },
+  { code: "DE", name: "Germany" },
+  { code: "FR", name: "France" },
+  { code: "ES", name: "Spain" },
+  { code: "IT", name: "Italy" },
+  { code: "NL", name: "Netherlands" },
+  { code: "SE", name: "Sweden" },
+  { code: "NO", name: "Norway" },
+  { code: "DK", name: "Denmark" },
+  { code: "FI", name: "Finland" },
+  { code: "IE", name: "Ireland" },
+  { code: "NZ", name: "New Zealand" },
+  { code: "JP", name: "Japan" },
+  { code: "BR", name: "Brazil" },
+  { code: "MX", name: "Mexico" },
+  { code: "AT", name: "Austria" },
+  { code: "BE", name: "Belgium" },
+  { code: "CH", name: "Switzerland" },
+  { code: "PT", name: "Portugal" },
+  { code: "PL", name: "Poland" },
+  { code: "CZ", name: "Czechia" },
+];
+
 function CustomPage() {
   const [artworkUrl, setArtworkUrl] = useState<string | null>(null);
   const [artworkName, setArtworkName] = useState<string>("");
   const [garment, setGarment] = useState<Garment>("tee");
   const [notes, setNotes] = useState("");
   const [email, setEmail] = useState("");
+  // Optional shipping section — entirely blank means "no address", which is
+  // the common one-tap checkout path. Filled partially, the server asks for
+  // the missing required fields (422 with field errors).
+  const [shipName, setShipName] = useState("");
+  const [shipLine1, setShipLine1] = useState("");
+  const [shipCity, setShipCity] = useState("");
+  const [shipState, setShipState] = useState("");
+  const [shipZip, setShipZip] = useState("");
+  const [shipCountry, setShipCountry] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -65,14 +103,36 @@ function CustomPage() {
     setError(null);
     setSubmitting(true);
     try {
+      // Only send the shipping object when at least one field is filled, so
+      // a blank section never registers as a partial address.
+      const shippingFields = {
+        name: shipName,
+        line1: shipLine1,
+        city: shipCity,
+        state: shipState,
+        zip: shipZip,
+        country: shipCountry,
+      };
+      const anyShipping = Object.values(shippingFields).some((v) => v.trim() !== "");
       const res = await fetch("/api/custom-orders", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ artworkUrl, garment, notes, customerEmail: email }),
+        body: JSON.stringify({
+          artworkUrl,
+          garment,
+          notes,
+          customerEmail: email,
+          ...(anyShipping ? { shipping: shippingFields } : {}),
+        }),
       });
       if (!res.ok) {
-        const data = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(data?.error ?? `Could not submit (${res.status})`);
+        const data = (await res.json().catch(() => null)) as
+          | { error?: string; fields?: Record<string, string> }
+          | null;
+        const fieldMsg = data?.fields
+          ? Object.values(data.fields).join(" · ")
+          : null;
+        throw new Error(fieldMsg ?? data?.error ?? `Could not submit (${res.status})`);
       }
       const order = (await res.json()) as { feeCents: number };
       setConfirmed({ feeCents: order.feeCents });
@@ -266,6 +326,76 @@ function CustomPage() {
               placeholder="you@example.com"
               className="mt-2 w-full rounded-xl border border-neutral-300 px-4 py-3"
             />
+          </div>
+
+          {/* ---- Optional shipping section ---- */}
+          <div className="rounded-2xl border border-neutral-200 p-4 sm:p-5">
+            <label className="block text-sm font-bold uppercase tracking-widest text-neutral-500">
+              Shipping address <span className="font-medium normal-case tracking-normal text-neutral-400">(optional — speeds up fulfillment)</span>
+            </label>
+            <p className="mt-1 text-xs text-neutral-500">
+              Needed before we can send your print, but you can add it later.
+              Leave blank to skip.
+            </p>
+            <div className="mt-3 space-y-3">
+              <input
+                type="text"
+                value={shipName}
+                onChange={(e) => setShipName(e.target.value)}
+                placeholder="Full name"
+                autoComplete="shipping name"
+                className="w-full rounded-xl border border-neutral-300 px-4 py-3"
+              />
+              <input
+                type="text"
+                value={shipLine1}
+                onChange={(e) => setShipLine1(e.target.value)}
+                placeholder="Street address"
+                autoComplete="shipping street-address"
+                className="w-full rounded-xl border border-neutral-300 px-4 py-3"
+              />
+              <div className="grid grid-cols-2 gap-3">
+                <input
+                  type="text"
+                  value={shipCity}
+                  onChange={(e) => setShipCity(e.target.value)}
+                  placeholder="City"
+                  autoComplete="shipping address-level2"
+                className="w-full rounded-xl border border-neutral-300 px-4 py-3"
+                />
+                <input
+                  type="text"
+                  value={shipState}
+                  onChange={(e) => setShipState(e.target.value)}
+                  placeholder="State (optional)"
+                  autoComplete="shipping address-level1"
+                  className="w-full rounded-xl border border-neutral-300 px-4 py-3"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <input
+                  type="text"
+                  value={shipZip}
+                  onChange={(e) => setShipZip(e.target.value)}
+                  placeholder="ZIP / postal code"
+                  autoComplete="shipping postal-code"
+                  className="w-full rounded-xl border border-neutral-300 px-4 py-3"
+                />
+                <select
+                  value={shipCountry}
+                  onChange={(e) => setShipCountry(e.target.value)}
+                  autoComplete="shipping country"
+                  className="w-full rounded-xl border border-neutral-300 bg-white px-4 py-3"
+                >
+                  <option value="">Country…</option>
+                  {COUNTRIES.map((c) => (
+                    <option key={c.code} value={c.code}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+                </div>
+            </div>
           </div>
 
           {error && <p className="text-sm text-red-600">{error}</p>}

@@ -37,6 +37,18 @@ export interface Product {
   designSvg?: string;
 }
 
+/** Optional shipping address a customer may attach to a custom order. */
+export interface ShippingAddress {
+  name: string;
+  line1: string;
+  city: string;
+  /** Optional (state/province/region). */
+  state?: string;
+  zip: string;
+  /** ISO 3166-1 alpha-2 country code, e.g. "US". */
+  country: string;
+}
+
 export interface CustomOrder {
   id: string;
   artworkUrl: string;
@@ -46,6 +58,8 @@ export interface CustomOrder {
   feeCents: number;
   status: "submitted";
   createdAt: string;
+  /** Present only when the customer filled the optional shipping section. */
+  shipping?: ShippingAddress;
 }
 
 export interface Settings {
@@ -83,6 +97,8 @@ export const CONFIG_KEYS = {
   imagePresignUrl: "imagePresignUrl",
   imageToken: "imageToken",
   stripeLinks: "stripeLinks",
+  printfulApiKey: "printfulApiKey",
+  printfulVariants: "printfulVariants",
 } as const;
 
 export type ConfigKey = (typeof CONFIG_KEYS)[keyof typeof CONFIG_KEYS];
@@ -258,6 +274,11 @@ async function runInit(): Promise<void> {
   await sql()`
     ALTER TABLE td_products ADD COLUMN IF NOT EXISTS design_svg TEXT
   `;
+  // Custom orders created before the optional shipping section need the JSONB
+  // column; idempotent ALTER for tables that predate it (phase 4a).
+  await sql()`
+    ALTER TABLE td_custom_orders ADD COLUMN IF NOT EXISTS shipping JSONB
+  `;
 }
 
 const pgAdapter = {
@@ -365,7 +386,7 @@ const pgAdapter = {
     await this.init();
     const rows = await sql()`
       SELECT id, artwork_url, garment, notes, customer_email,
-             fee_cents, status, created_at
+             fee_cents, status, created_at, shipping
       FROM td_custom_orders ORDER BY created_at DESC
     `;
     return rows.map(rowToOrder);
@@ -376,13 +397,15 @@ const pgAdapter = {
   ): Promise<CustomOrder> {
     await this.init();
     const id = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // shipping is optional; the column is JSONB and NULL when absent.
+    const shippingJson = input.shipping ? JSON.stringify(input.shipping) : null;
     const rows = await sql()`
       INSERT INTO td_custom_orders (id, artwork_url, garment, notes,
-                                    customer_email, fee_cents, status)
+                                    customer_email, fee_cents, status, shipping)
       VALUES (${id}, ${input.artworkUrl}, ${input.garment}, ${input.notes ?? null},
-              ${input.customerEmail}, ${input.feeCents}, 'submitted')
+              ${input.customerEmail}, ${input.feeCents}, 'submitted', ${shippingJson}::jsonb)
       RETURNING id, artwork_url, garment, notes, customer_email,
-                fee_cents, status, created_at
+                fee_cents, status, created_at, shipping
     `;
     return rowToOrder(rows[0]);
   },
@@ -461,6 +484,19 @@ function rowToProduct(r: AnyRow): Product {
 }
 
 function rowToOrder(r: AnyRow): CustomOrder {
+  // shipping is a JSONB object (Postgres) or a pre-parsed object (file mode);
+  // tolerate a JSON-encoded string just in case.
+  let shipping: ShippingAddress | undefined;
+  const rawShipping = r.shipping;
+  if (typeof rawShipping === "string" && rawShipping) {
+    try {
+      shipping = JSON.parse(rawShipping) as ShippingAddress;
+    } catch {
+      shipping = undefined;
+    }
+  } else if (rawShipping && typeof rawShipping === "object") {
+    shipping = rawShipping as ShippingAddress;
+  }
   return {
     id: String(r.id),
     artworkUrl: String(r.artwork_url),
@@ -471,6 +507,7 @@ function rowToOrder(r: AnyRow): CustomOrder {
     status: "submitted",
     createdAt:
       r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+    ...(shipping ? { shipping } : {}),
   };
 }
 

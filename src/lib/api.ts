@@ -8,8 +8,9 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { store, CONFIG_KEYS, isPostgresMode } from "~/lib/store";
+import { store, CONFIG_KEYS, isPostgresMode, type ShippingAddress } from "~/lib/store";
 import { queueSubmittedCustomOrders } from "~/lib/fulfillment";
+import { resolveKey, resolveVariantMap } from "~/lib/printful";
 import {
   defaultDesignName,
   describeDesign,
@@ -270,6 +271,48 @@ const designFileTaken = async (filename: string): Promise<boolean> => {
   }
 };
 
+/**
+ * Optional shipping address validation for custom orders. If EVERY field is
+ * empty/absent the address counts as "not provided" (ok, null). If any field
+ * is set, the required set (name, line1, city, zip, country) must all be
+ * present — else field-level errors. state is always optional.
+ */
+function validateShipping(raw: unknown):
+  | { ok: true; value: ShippingAddress | undefined }
+  | { ok: false; errors: Record<string, string> } {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined };
+  if (typeof raw !== "object") {
+    return { ok: false, errors: { shipping: "shipping must be an object" } };
+  }
+  const s = raw as Record<string, unknown>;
+  const get = (k: string): string =>
+    typeof s[k] === "string" ? (s[k] as string).trim() : "";
+  const anySet = ["name", "line1", "city", "state", "zip", "country"].some(
+    (k) => get(k) !== ""
+  );
+  if (!anySet) return { ok: true, value: undefined };
+
+  const errors: Record<string, string> = {};
+  if (!get("name")) errors.name = "Name is required";
+  if (!get("line1")) errors.line1 = "Street address is required";
+  if (!get("city")) errors.city = "City is required";
+  if (!get("zip")) errors.zip = "ZIP / postal code is required";
+  if (!get("country")) errors.country = "Country is required";
+  if (Object.keys(errors).length > 0) return { ok: false, errors };
+
+  return {
+    ok: true,
+    value: {
+      name: get("name"),
+      line1: get("line1"),
+      city: get("city"),
+      ...(get("state") ? { state: get("state") } : {}),
+      zip: get("zip"),
+      country: get("country").toUpperCase().slice(0, 2),
+    },
+  };
+}
+
 // ---------- rest of the API ----------
 
 /** Central API handler. Returns null when the path is not an API path. */
@@ -307,10 +350,16 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       return json(200, { url, filename: file.name, slug: slugFromFilename(file.name) });
     }
 
-    // POST /api/custom-orders — JSON; saves a submitted custom order
+    // POST /api/custom-orders — JSON; saves a submitted custom order.
+    // Shipping is optional; when any shipping field is set, the required set
+    // (name, line1, city, zip, country) must be complete — else 422 with
+    // field-level errors.
     if (req.method === "POST" && pathname === "/api/custom-orders") {
       const raw = await req.json();
-      const { artworkUrl, garment, notes, customerEmail } = raw as Record<string, unknown>;
+      const { artworkUrl, garment, notes, customerEmail, shipping } = raw as Record<
+        string,
+        unknown
+      >;
       if (typeof artworkUrl !== "string" || !artworkUrl) {
         return json(400, { error: "artworkUrl is required" });
       }
@@ -320,12 +369,20 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       if (typeof customerEmail !== "string" || !/^\S+@\S+\.\S+$/.test(customerEmail)) {
         return json(400, { error: "A valid customerEmail is required" });
       }
+      const shippingResult = validateShipping(shipping);
+      if (!shippingResult.ok) {
+        return json(422, {
+          error: "Shipping address is incomplete",
+          fields: shippingResult.errors,
+        });
+      }
       const settings = await store.getSettings();
       const order = await store.createCustomOrder({
         artworkUrl,
         garment,
         notes: typeof notes === "string" && notes.trim() ? notes.trim() : undefined,
         customerEmail,
+        shipping: shippingResult.value,
         feeCents: settings.customFeeCents,
       });
       return json(201, order);
@@ -523,6 +580,34 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       // GET /api/owner/fulfillment — the fulfillment queue.
       if (req.method === "GET" && pathname === "/api/owner/fulfillment") {
         return json(200, await store.listFulfillmentItems());
+      }
+
+      // GET /api/owner/printful — phase 4a status probe for the dashboard.
+      // Reports resolvability of the key and the variant mapping, plus
+      // store connectivity as HTTP status ONLY (never the key, never full
+      // response bodies). 502 when the API is unreachable or errors.
+      if (req.method === "GET" && pathname === "/api/owner/printful") {
+        const key = await resolveKey();
+        const keySet = Boolean(key);
+        const variants = await resolveVariantMap();
+        let storeStatus: number | null = null;
+        if (keySet) {
+          try {
+            const res = await fetch("https://api.printful.com/stores", {
+              headers: { Authorization: `Bearer ${key}` },
+            });
+            storeStatus = res.status;
+          } catch {
+            storeStatus = null;
+          }
+        }
+        return json(200, {
+          keySet,
+          variants,
+          storeStatus,
+          phase: "4a",
+          orderCreation: "phase 4b",
+        });
       }
 
       return json(404, { error: "Not found" });

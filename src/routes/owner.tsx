@@ -37,6 +37,21 @@ interface CustomOrder {
   feeCents: number;
   status: string;
   createdAt: string;
+  shipping?: {
+    name: string;
+    line1: string;
+    city: string;
+    state?: string;
+    zip: string;
+    country: string;
+  } | null;
+}
+
+/** One-line "City, ST" style summary of an optional shipping address. */
+function shipToLine(o: CustomOrder | undefined): string {
+  if (!o?.shipping) return "No address yet";
+  const s = o.shipping;
+  return [s.city, s.state, s.country.toUpperCase()].filter(Boolean).join(", ");
 }
 
 interface FulfillmentItem {
@@ -678,7 +693,8 @@ function Dashboard(props: {
           </div>
           <p className="mt-1 text-xs text-neutral-500">
             Custom orders waiting for the print partner. Queueing is idempotent —
-            already-queued orders are skipped.
+            already-queued orders are skipped. &ldquo;Fulfill via Printful&rdquo;
+            goes live in phase 4b.
           </p>
           {queueMsg && (
             <p className="mt-2 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-2 text-sm text-neutral-700">
@@ -692,19 +708,22 @@ function Dashboard(props: {
             </p>
           ) : (
             <div className="mt-4 overflow-x-auto">
-              <table className="w-full min-w-[560px] text-left text-sm">
+              <table className="w-full min-w-[720px] text-left text-sm">
                 <thead>
                   <tr className="border-b border-neutral-200 text-xs uppercase tracking-widest text-neutral-500">
                     <th className="py-2 pr-3 font-bold">Email</th>
                     <th className="py-2 pr-3 font-bold">Garment</th>
                     <th className="py-2 pr-3 font-bold">Fee</th>
+                    <th className="py-2 pr-3 font-bold">Ship to</th>
                     <th className="py-2 pr-3 font-bold">Queued</th>
-                    <th className="py-2 font-bold">Status</th>
+                    <th className="py-2 pr-3 font-bold">Status</th>
+                    <th className="py-2 font-bold">Print</th>
                   </tr>
                 </thead>
                 <tbody>
                   {fulfillment.map((f) => {
                     const order = orders.find((o) => o.id === f.orderId);
+                    const shipTo = shipToLine(order);
                     return (
                       <tr key={f.orderId} className="border-b border-neutral-100">
                         <td className="max-w-40 truncate py-2 pr-3 font-medium">
@@ -712,6 +731,12 @@ function Dashboard(props: {
                         </td>
                         <td className="py-2 pr-3 capitalize">{f.garment}</td>
                         <td className="py-2 pr-3">{usd(f.feeCents)}</td>
+                        <td
+                          className="max-w-44 truncate py-2 pr-3 text-neutral-600"
+                          title={order?.shipping ? `${order.shipping.name}, ${order.shipping.line1}, ${shipTo}` : undefined}
+                        >
+                          {shipTo}
+                        </td>
                         <td className="py-2 pr-3 text-neutral-500">
                           <span title={order ? `Submitted ${new Date(order.createdAt).toLocaleString("en-US")}` : undefined}>
                             {new Date(f.queuedAt).toLocaleDateString("en-US", {
@@ -725,9 +750,18 @@ function Dashboard(props: {
                             })}
                           </span>
                         </td>
-                        <td className="py-2">
+                        <td className="py-2 pr-3">
                           <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-bold text-blue-800">
                             {f.status}
+                          </span>
+                        </td>
+                        <td className="py-2">
+                          <span
+                            title="Phase 4b: one click after Printful mapping confirmed"
+                            className="cursor-not-allowed rounded-full border border-neutral-300 bg-neutral-100 px-3 py-1.5 text-xs font-semibold text-neutral-400 select-none"
+                            aria-disabled="true"
+                          >
+                            Fulfill via Printful
                           </span>
                         </td>
                       </tr>

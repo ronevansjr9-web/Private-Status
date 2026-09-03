@@ -13,6 +13,12 @@
 //                    priceId+url payment-link map; runtime data, not a secret —
 //                    stored as a JSON string so payments.ts can read it in
 //                    Postgres mode where the data/ file may not exist)
+//   printfulVariants ← data/printful-variants.json contents (garment →
+//                    Printful catalog variant/product ids; runtime data).
+//                    Refresh with REFRESH_PRINTFUL_VARIANTS=1 when the owner
+//                    changes the Printful product mapping.
+//   (printfulApiKey is seeded separately by scripts/set-printful-key.ts —
+//   env values are never read into the config store automatically.)
 //
 // Values are never printed, logged, or committed.
 
@@ -22,6 +28,7 @@ import type { ConfigKey } from "../src/lib/store";
 
 const OWNER_KEY_PATH = "/home/team/shared/.secrets/owner-key";
 const STRIPE_LINKS_PATH = "data/stripe-links.json";
+const PRINTFUL_VARIANTS_PATH = "data/printful-variants.json";
 
 async function readTrimmed(path: string): Promise<string | null> {
   try {
@@ -95,6 +102,27 @@ async function main() {
     }
   } catch {
     console.log(`- ${CONFIG_KEYS.stripeLinks} (${STRIPE_LINKS_PATH} missing or empty, skipped)`);
+  }
+  // printfulVariants: garment → Printful catalog variant/product ids (runtime
+  // data, not a secret). Same JSON-string pattern as stripeLinks; refresh with
+  // REFRESH_PRINTFUL_VARIANTS=1 when the owner changes the mapping.
+  try {
+    const current = await store.getConfig(CONFIG_KEYS.printfulVariants);
+    const raw = (await readFile(PRINTFUL_VARIANTS_PATH, "utf8")).trim();
+    if (raw && (current !== raw || process.env.REFRESH_PRINTFUL_VARIANTS === "1")) {
+      await store.setConfig(CONFIG_KEYS.printfulVariants, raw);
+      if (current) {
+        console.log(`~ ${CONFIG_KEYS.printfulVariants} updated from ${PRINTFUL_VARIANTS_PATH}`);
+      } else {
+        console.log(`+ ${CONFIG_KEYS.printfulVariants} set from ${PRINTFUL_VARIANTS_PATH}`);
+      }
+    } else if (current) {
+      console.log(`= ${CONFIG_KEYS.printfulVariants} already set (matches file)`);
+    } else {
+      console.log(`- ${CONFIG_KEYS.printfulVariants} (${PRINTFUL_VARIANTS_PATH} missing or empty, skipped)`);
+    }
+  } catch {
+    console.log(`- ${CONFIG_KEYS.printfulVariants} (${PRINTFUL_VARIANTS_PATH} missing or empty, skipped)`);
   }
 
   console.log(`sync-config done — config store: ${mode}`);
