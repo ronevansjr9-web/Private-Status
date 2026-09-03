@@ -436,13 +436,17 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       }
 
       // Everything else under /api/owner/* requires the owner key.
+      // The body is optional for many of these endpoints (e.g. the Printful
+      // fulfill button authenticates via the X-Owner-Key header alone), so a
+      // missing/unparseable body must NOT block auth — it just leaves body
+      // null. Endpoints that need fields validate them below.
       let bodyKey: unknown;
       let body: Record<string, unknown> | null = null;
       if (req.method === "POST") {
         try {
           body = (await req.json()) as Record<string, unknown>;
         } catch {
-          return json(400, { error: "Invalid JSON body" });
+          body = null;
         }
         bodyKey = body?.key;
       }
@@ -452,6 +456,7 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       // POST /api/owner/designs — owner submits a design; the product is
       // created automatically (slug, copy, prices) and returned live.
       if (req.method === "POST" && pathname === "/api/owner/designs") {
+        if (!body) return json(400, { error: "Request body is required" });
         const b = body as Record<string, unknown>;
         const mode = b.mode;
         const nameInput =

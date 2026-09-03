@@ -223,7 +223,11 @@ export async function createStoreOrder(
   }
 
   const body = {
-    external_id: `threaddrop-custom-${input.orderId}`,
+    // Printful caps external_id length (verified 2026-09-03: 12- and 22-char
+    // values accepted, 33+ rejected with 400 "Invalid External ID
+    // specified"). Our order ids are c_<ms>_<rand>; truncating to 20 keeps
+    // the full millisecond timestamp and stays safely inside the cap.
+    external_id: input.orderId.slice(0, 20),
     recipient: toPrintfulRecipient(input.shipping),
     items: [
       {
