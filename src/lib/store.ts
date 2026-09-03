@@ -194,54 +194,81 @@ const fileAdapter = {
 
 // ---------- Postgres adapter ----------
 
+// init() is DDL-idempotent and awaited by every store operation; over the HTTP
+// driver each sql() call is a network round trip, so run it once per process.
+// A failed init clears the cache so the next call retries.
+let initPromise: Promise<void> | null = null;
+
+async function runInit(): Promise<void> {
+  // Neon's serverless driver sends each sql() template as ONE prepared
+  // statement over HTTP, so multiple commands in one template fail with
+  // "cannot insert multiple commands into a prepared statement" (42601).
+  // One statement per call, all idempotent.
+  await sql()`
+    CREATE TABLE IF NOT EXISTS td_products (
+      id TEXT PRIMARY KEY,
+      slug TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      design_image_url TEXT NOT NULL,
+      price_tee_cents INTEGER NOT NULL,
+      price_hoodie_cents INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'live',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `;
+  await sql()`
+    CREATE TABLE IF NOT EXISTS td_custom_orders (
+      id TEXT PRIMARY KEY,
+      artwork_url TEXT NOT NULL,
+      garment TEXT NOT NULL,
+      notes TEXT,
+      customer_email TEXT NOT NULL,
+      fee_cents INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'submitted',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `;
+  await sql()`
+    CREATE TABLE IF NOT EXISTS td_settings (
+      key TEXT PRIMARY KEY,
+      value JSONB NOT NULL
+    )
+  `;
+  await sql()`
+    CREATE TABLE IF NOT EXISTS td_config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `;
+  await sql()`
+    CREATE TABLE IF NOT EXISTS td_fulfillment (
+      order_id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      garment TEXT NOT NULL,
+      artwork_url TEXT NOT NULL,
+      customer_email TEXT NOT NULL,
+      fee_cents INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      queued_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `;
+  // Designs created after the td_products table may need the SVG column;
+  // idempotent ADD COLUMN for tables that predate it.
+  await sql()`
+    ALTER TABLE td_products ADD COLUMN IF NOT EXISTS design_svg TEXT
+  `;
+}
+
 const pgAdapter = {
   async init(): Promise<void> {
-    await sql()`
-      CREATE TABLE IF NOT EXISTS td_products (
-        id TEXT PRIMARY KEY,
-        slug TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL,
-        description TEXT NOT NULL,
-        design_image_url TEXT NOT NULL,
-        price_tee_cents INTEGER NOT NULL,
-        price_hoodie_cents INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'live',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-      CREATE TABLE IF NOT EXISTS td_custom_orders (
-        id TEXT PRIMARY KEY,
-        artwork_url TEXT NOT NULL,
-        garment TEXT NOT NULL,
-        notes TEXT,
-        customer_email TEXT NOT NULL,
-        fee_cents INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'submitted',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-      CREATE TABLE IF NOT EXISTS td_settings (
-        key TEXT PRIMARY KEY,
-        value JSONB NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS td_config (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS td_fulfillment (
-        order_id TEXT PRIMARY KEY,
-        type TEXT NOT NULL,
-        garment TEXT NOT NULL,
-        artwork_url TEXT NOT NULL,
-        customer_email TEXT NOT NULL,
-        fee_cents INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'queued',
-        queued_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `;
-    // Designs created after the td_products table may need the SVG column;
-    // idempotent ADD COLUMN for tables that predate it.
-    await sql()`
-      ALTER TABLE td_products ADD COLUMN IF NOT EXISTS design_svg TEXT
-    `;
+    if (!initPromise) {
+      initPromise = runInit().catch((err) => {
+        initPromise = null;
+        throw err;
+      });
+    }
+    await initPromise;
   },
 
   async listProducts(): Promise<Product[]> {
