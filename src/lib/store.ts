@@ -99,6 +99,20 @@ export interface FulfillmentItem {
   printful?: FulfillmentPrintfulInfo;
 }
 
+/**
+ * Generated garment mockups for one design (phase 5a). Keyed by the product's
+ * design URL + garment; URLs are durable CloudFront copies of Printful's
+ * (possibly ephemeral) mockup images. wornUrl is null when only the flat
+ * shot came back.
+ */
+export interface MockupRecord {
+  designUrl: string;
+  garment: Garment;
+  flatUrl: string | null;
+  wornUrl: string | null;
+  createdAt: string;
+}
+
 // ---------- config store (small runtime settings that must survive a deploy) ----------
 
 // Known config keys. Secrets are stored as values, never as key names — key
@@ -240,6 +254,36 @@ const fileAdapter = {
     const items = await readJson<FulfillmentItem[]>("fulfillment.json", []);
     return items.find((i) => i.orderId === orderId) ?? null;
   },
+  // ---------- phase 5a mockup cache (file adapter: data/mockups.json) ----------
+  async getMockup(designUrl: string, garment: Garment): Promise<MockupRecord | null> {
+    const all = await readJson<MockupRecord[]>("mockups.json", []);
+    return (
+      all.find((m) => m.designUrl === designUrl && m.garment === garment) ?? null
+    );
+  },
+  async putMockup(record: MockupRecord): Promise<MockupRecord> {
+    const all = await readJson<MockupRecord[]>("mockups.json", []);
+    const idx = all.findIndex(
+      (m) => m.designUrl === record.designUrl && m.garment === record.garment
+    );
+    if (idx === -1) all.push(record);
+    else all[idx] = record;
+    await writeJson("mockups.json", all);
+    return record;
+  },
+  async insertMockupIfAbsent(record: MockupRecord): Promise<MockupRecord | null> {
+    // Concurrent-dedupe primitive (mirrors the SQL ON CONFLICT DO NOTHING +
+    // re-read): returns the WINNING row — the caller's when it won the race,
+    // the existing one when another process inserted first — and null never.
+    const all = await readJson<MockupRecord[]>("mockups.json", []);
+    const existing = all.find(
+      (m) => m.designUrl === record.designUrl && m.garment === record.garment
+    );
+    if (existing) return existing;
+    all.push(record);
+    await writeJson("mockups.json", all);
+    return record;
+  },
 };
 
 // ---------- Postgres adapter ----------
@@ -323,6 +367,17 @@ async function runInit(): Promise<void> {
   // column; idempotent ALTER for tables that predate it (phase 4a).
   await sql()`
     ALTER TABLE td_custom_orders ADD COLUMN IF NOT EXISTS shipping JSONB
+  `;
+  // Phase 5a: generated garment mockups per design URL + garment.
+  await sql()`
+    CREATE TABLE IF NOT EXISTS td_mockups (
+      design_url TEXT NOT NULL,
+      garment TEXT NOT NULL,
+      flat_url TEXT,
+      worn_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (design_url, garment)
+    )
   `;
 }
 
@@ -543,6 +598,47 @@ const pgAdapter = {
     `;
     return rows.length ? rowToFulfillment(rows[0]) : null;
   },
+
+  // ---------- phase 5a mockup cache ----------
+  async getMockup(designUrl: string, garment: Garment): Promise<MockupRecord | null> {
+    await this.init();
+    const rows = await sql()`
+      SELECT design_url, garment, flat_url, worn_url, created_at
+      FROM td_mockups WHERE design_url = ${designUrl} AND garment = ${garment} LIMIT 1
+    `;
+    return rows.length ? rowToMockup(rows[0]) : null;
+  },
+
+  /** Unconditional write (refresh path) — upserts on the UNIQUE pair. */
+  async putMockup(record: MockupRecord): Promise<MockupRecord> {
+    await this.init();
+    const rows = await sql()`
+      INSERT INTO td_mockups (design_url, garment, flat_url, worn_url)
+      VALUES (${record.designUrl}, ${record.garment}, ${record.flatUrl}, ${record.wornUrl})
+      ON CONFLICT (design_url, garment)
+      DO UPDATE SET flat_url = ${record.flatUrl}, worn_url = ${record.wornUrl}
+      RETURNING design_url, garment, flat_url, worn_url, created_at
+    `;
+    return rowToMockup(rows[0]);
+  },
+
+  /**
+   * Concurrent-dedupe primitive (phase 5a): ON CONFLICT DO NOTHING, then
+   * re-read the winner. Returns the WINNING row — the caller's when it won
+   * the race, the existing one when another process inserted first — so the
+   * caller can tell whether its own generation effort was needed.
+   */
+  async insertMockupIfAbsent(record: MockupRecord): Promise<MockupRecord | null> {
+    await this.init();
+    const inserted = await sql()`
+      INSERT INTO td_mockups (design_url, garment, flat_url, worn_url)
+      VALUES (${record.designUrl}, ${record.garment}, ${record.flatUrl}, ${record.wornUrl})
+      ON CONFLICT (design_url, garment) DO NOTHING
+      RETURNING design_url, garment, flat_url, worn_url, created_at
+    `;
+    if (inserted.length) return rowToMockup(inserted[0]);
+    return this.getMockup(record.designUrl, record.garment);
+  },
 };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -623,6 +719,19 @@ function rowToFulfillment(r: AnyRow): FulfillmentItem {
   };
 }
 
+function rowToMockup(r: AnyRow): MockupRecord {
+  return {
+    designUrl: String(r.design_url),
+    garment: r.garment === "hoodie" ? "hoodie" : "tee",
+    flatUrl: r.flat_url == null ? null : String(r.flat_url),
+    wornUrl: r.worn_url == null ? null : String(r.worn_url),
+    createdAt:
+      r.created_at instanceof Date
+        ? r.created_at.toISOString()
+        : String(r.created_at),
+  };
+}
+
 // ---------- one interface, chosen per call ----------
 
 export const store = {
@@ -674,4 +783,23 @@ export const store = {
     usePostgres()
       ? pgAdapter.updateFulfillmentStatus(orderId, update)
       : fileAdapter.updateFulfillmentStatus(orderId, update),
+  // ---------- phase 5a mockup cache ----------
+  /** Cached mockup row for a design URL + garment (null = miss). */
+  getMockup: (designUrl: string, garment: Garment) =>
+    usePostgres()
+      ? pgAdapter.getMockup(designUrl, garment)
+      : fileAdapter.getMockup(designUrl, garment),
+  /** Unconditional upsert of a mockup row. */
+  putMockup: (record: MockupRecord) =>
+    usePostgres()
+      ? pgAdapter.putMockup(record)
+      : fileAdapter.putMockup(record),
+  /**
+   * Insert-if-absent used by getOrGenerateMockups so two concurrent callers
+   * for the same design + garment cannot both pay for a Printful task.
+   */
+  insertMockupIfAbsent: (record: MockupRecord) =>
+    usePostgres()
+      ? pgAdapter.insertMockupIfAbsent(record)
+      : fileAdapter.insertMockupIfAbsent(record),
 };

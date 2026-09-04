@@ -1,17 +1,19 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { getLiveProducts } from "~/lib/server";
-import type { Product } from "~/lib/store";
+import { getLiveProductsWithMockups } from "~/lib/server";
+import type { LiveProductCard } from "~/lib/server";
 
 export const Route = createFileRoute("/")({
   component: Home,
-  loader: async () => ({ products: await getLiveProducts() }),
+  loader: async () => ({
+    products: (await getLiveProductsWithMockups()) as LiveProductCard[],
+  }),
 });
 
 const usd = (cents: number) =>
   (cents / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
 
 function Home() {
-  const { products } = Route.useLoaderData() as { products: Product[] };
+  const { products } = Route.useLoaderData() as { products: LiveProductCard[] };
   return (
     <main className="min-h-dvh bg-white text-neutral-900">
       <header className="border-b border-neutral-200">
@@ -87,7 +89,7 @@ function Home() {
                 className="group block overflow-hidden rounded-2xl border border-neutral-200 active:border-neutral-400"
               >
                 <img
-                  src={p.designImageUrl}
+                  src={p.flatMockupUrl ?? p.designImageUrl}
                   alt={p.name}
                   className="aspect-square w-full bg-white object-cover"
                 />

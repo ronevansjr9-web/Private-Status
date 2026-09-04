@@ -21,6 +21,7 @@ import {
   describeImageDesign,
   generateDesign,
 } from "~/lib/designgen";
+import { getOrGenerateMockups } from "~/lib/mockups";
 
 export interface ApiResult {
   status: number;
@@ -573,6 +574,29 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
                 priceTeeCents: teeCents,
                 priceHoodieCents: hoodieCents,
               });
+
+        // Phase 5a: best-effort garment mockups for the new design. Awaited
+        // inside try/catch so a Printful failure/rate-limit can never fail
+        // (or meaningfully delay the 201 of) the product creation itself.
+        try {
+          const [teeMockup, hoodieMockup] = await Promise.all([
+            getOrGenerateMockups(designImageUrl, "tee"),
+            getOrGenerateMockups(designImageUrl, "hoodie"),
+          ]);
+          if (!teeMockup || !hoodieMockup) {
+            console.warn(
+              `[mockups] partial/failed generation for ${slug}` +
+                ` (tee: ${teeMockup ? "ok" : "none"}, hoodie: ${hoodieMockup ? "ok" : "none"})` +
+                " — product page will lazy-fill later"
+            );
+          }
+        } catch (mockupErr) {
+          console.warn(
+            "[mockups] generation error after product creation:",
+            mockupErr instanceof Error ? mockupErr.message : mockupErr
+          );
+        }
+
         return json(201, product);
       }
 

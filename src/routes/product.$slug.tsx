@@ -1,26 +1,86 @@
 import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useState } from "react";
-import { getProductBySlug, getProductPayment } from "~/lib/server";
+import type { MockupRecord } from "~/lib/store";
+import {
+  getProductBySlug,
+  getProductMockups,
+  getProductPayment,
+} from "~/lib/server";
+
 export const Route = createFileRoute("/product/$slug")({
   component: ProductPage,
   loader: async ({ params }) => {
     const product = await getProductBySlug({ data: params.slug });
     if (!product) throw notFound();
-    const [tee, hoodie] = await Promise.all([
+    // Mockups are cache-first; on a miss the server fn generates boundedly
+    // (lazy-fill). When nothing comes back the design-image UI stands.
+    const [mockups, teePay, hoodiePay] = await Promise.all([
+      getProductMockups({ data: params.slug }),
       getProductPayment({ data: { slug: params.slug, garment: "tee" } }),
       getProductPayment({ data: { slug: params.slug, garment: "hoodie" } }),
     ]);
-    return { product, payment: { tee: tee.url, hoodie: hoodie.url } };
+    return {
+      product,
+      payment: { tee: teePay.url, hoodie: hoodiePay.url },
+      mockups,
+    };
   },
 });
+
 const usd = (cents: number) =>
   (cents / 100).toLocaleString("en-US", { style: "currency", currency: "USD" });
+
 type Garment = "tee" | "hoodie";
+
+interface GalleryItem {
+  key: string;
+  src: string;
+  label: string;
+}
+
+/**
+ * Gallery for the selected garment: the design artwork always leads, the flat
+ * garment mockup and the worn model shot follow when cached. The flat mockup
+ * is the default main image when present ("main = flat mockup if cached else
+ * the design image").
+ */
+function buildGallery(
+  garment: Garment,
+  designUrl: string,
+  mockup: MockupRecord | null
+): { items: GalleryItem[]; defaultKey: string } {
+  const items: GalleryItem[] = [
+    { key: "design", src: designUrl, label: "Design artwork" },
+  ];
+  if (mockup?.flatUrl) {
+    items.push({
+      key: "flat",
+      src: mockup.flatUrl,
+      label: `Flat — ${garment === "tee" ? "tee" : "hoodie"}`,
+    });
+  }
+  if (mockup?.wornUrl) {
+    items.push({ key: "worn", src: mockup.wornUrl, label: "Worn — model shot" });
+  }
+  return { items, defaultKey: mockup?.flatUrl ? "flat" : "design" };
+}
+
 function ProductPage() {
-  const { product, payment } = Route.useLoaderData();
+  const { product, payment, mockups } = Route.useLoaderData();
   const [garment, setGarment] = useState<Garment>("tee");
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const price = garment === "tee" ? product.priceTeeCents : product.priceHoodieCents;
   const checkoutUrl = payment[garment];
+
+  const mockup = garment === "tee" ? mockups.tee : mockups.hoodie;
+  const { items: gallery, defaultKey } = buildGallery(
+    garment,
+    product.designImageUrl,
+    mockup
+  );
+  const active =
+    gallery.find((i) => i.key === (selectedKey ?? defaultKey)) ?? gallery[0];
+
   return (
     <main className="min-h-dvh bg-white text-neutral-900">
       <header className="border-b border-neutral-200">
@@ -41,11 +101,44 @@ function ProductPage() {
           ← Back to the drop
         </Link>
         <div className="mt-4 grid gap-8 sm:grid-cols-2">
-          <img
-            src={product.designImageUrl}
-            alt={product.name}
-            className="aspect-square w-full rounded-2xl border border-neutral-200 bg-white object-cover"
-          />
+          <div>
+            <img
+              src={active.src}
+              alt={`${product.name} — ${active.label}`}
+              className="aspect-square w-full rounded-2xl border border-neutral-200 bg-white object-cover"
+            />
+            <p className="mt-2 text-xs font-medium uppercase tracking-widest text-neutral-500">
+              {active.label}
+            </p>
+            {gallery.length > 1 && (
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                {gallery.map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setSelectedKey(item.key)}
+                    aria-label={item.label}
+                    aria-pressed={active.key === item.key}
+                    className={
+                      "overflow-hidden rounded-xl border bg-white " +
+                      (active.key === item.key
+                        ? "border-neutral-900"
+                        : "border-neutral-200 active:border-neutral-400")
+                    }
+                  >
+                    <img
+                      src={item.src}
+                      alt={item.label}
+                      className="aspect-square w-full object-cover"
+                    />
+                    <span className="block truncate px-1 py-1 text-[10px] leading-tight text-neutral-500">
+                      {item.label}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <div>
             <h1 className="text-3xl font-black tracking-tight">{product.name}</h1>
             <p className="mt-3 text-neutral-600">{product.description}</p>
