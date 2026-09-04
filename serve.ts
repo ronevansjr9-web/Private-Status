@@ -52,9 +52,13 @@ for (let attempt = 1; ; attempt++) {
               : body instanceof Uint8Array
                 ? body
                 : JSON.stringify(body);
+          const headers: Record<string, string> = {
+            "content-type": apiResult.contentType ?? "application/json",
+            ...(apiResult.headers ?? {}),
+          };
           return new Response(payload, {
             status: apiResult.status,
-            headers: { "content-type": apiResult.contentType ?? "application/json" },
+            headers,
           });
         }
         if (pathname !== "/") {

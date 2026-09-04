@@ -223,6 +223,12 @@ function CustomPage() {
           <Link to="/" className="text-lg font-black tracking-tight">
             ThreadDrop
           </Link>
+          <Link
+            to="/account"
+            className="text-sm font-semibold text-neutral-600 hover:text-neutral-900"
+          >
+            My orders
+          </Link>
         </div>
       </header>
 

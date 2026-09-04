@@ -112,6 +112,42 @@ export interface MockupRecord {
   wornUrl: string | null;
   createdAt: string;
 }
+// ---------- customer auth (phase 5b) ----------
+/** A stored magic login code — the hash, never the code itself. */
+export interface LoginCodeRecord {
+  email: string;
+  /** sha256 hex of the 6-digit code; the plaintext is never persisted. */
+  codeHash: string;
+  expiresAt: string;
+  usedAt: string | null;
+  createdAt: string;
+}
+/** A customer session — the token lives only in the cookie. */
+export interface SessionRecord {
+  token: string;
+  email: string;
+  createdAt: string;
+  expiresAt: string;
+}
+/**
+ * One of a customer's custom orders as shown on /account. Joins the custom
+ * order row with its fulfillment row (queued / sent_to_printful + the
+ * Printful order id) so the page can show real production status.
+ */
+export interface CustomerOrderView {
+  id: string;
+  garment: Garment;
+  /** "submitted" — the fulfillment status lives in `fulfillment`. */
+  status: string;
+  /** null = not in the fulfillment queue yet. */
+  fulfillment: {
+    status: "queued" | "sent_to_printful";
+    printfulOrderId: number | null;
+  } | null;
+  feeCents: number;
+  createdAt: string;
+  artworkUrl: string;
+}
 
 // ---------- config store (small runtime settings that must survive a deploy) ----------
 
@@ -124,6 +160,10 @@ export const CONFIG_KEYS = {
   stripeLinks: "stripeLinks",
   printfulApiKey: "printfulApiKey",
   printfulVariants: "printfulVariants",
+  // Phase 5b: Knock (email delivery) credentials. Values are secrets — key
+  // names are safe to print, values never are. Server-side trigger only.
+  knockApiKey: "knockApiKey",
+  knockSigningKey: "knockSigningKey",
 } as const;
 
 export type ConfigKey = (typeof CONFIG_KEYS)[keyof typeof CONFIG_KEYS];
@@ -284,6 +324,90 @@ const fileAdapter = {
     await writeJson("mockups.json", all);
     return record;
   },
+  // ---------- phase 5b customer auth (file adapter: data/login-codes.json, data/sessions.json) ----------
+  async createLoginCode(record: LoginCodeRecord): Promise<void> {
+    const all = await readJson<LoginCodeRecord[]>("login-codes.json", []);
+    all.push(record);
+    // Opportunistic cleanup: drop rows that can no longer count toward the
+    // rate limit (older than the 15-min window) or ever verify again.
+    const keep = all.filter((r) => {
+      if (r.usedAt) return false;
+      const ageMs = Date.now() - new Date(r.createdAt).getTime();
+      return ageMs < 16 * 60 * 1000;
+    });
+    await writeJson("login-codes.json", keep);
+  },
+  async countRecentLoginCodes(email: string, sinceIso: string): Promise<number> {
+    const all = await readJson<LoginCodeRecord[]>("login-codes.json", []);
+    const since = new Date(sinceIso).getTime();
+    return all.filter(
+      (r) => r.email === email && !r.usedAt && new Date(r.createdAt).getTime() >= since
+    ).length;
+  },
+  async findLatestLoginCode(email: string): Promise<LoginCodeRecord | null> {
+    const all = await readJson<LoginCodeRecord[]>("login-codes.json", []);
+    const mine = all
+      .filter((r) => r.email === email && !r.usedAt)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return mine[0] ?? null;
+  },
+  async markLoginCodeUsed(email: string, codeHash: string): Promise<void> {
+    const all = await readJson<LoginCodeRecord[]>("login-codes.json", []);
+    const row = all.find(
+      (r) => r.email === email && r.codeHash === codeHash && !r.usedAt
+    );
+    if (row) {
+      row.usedAt = new Date().toISOString();
+      await writeJson("login-codes.json", all);
+    }
+  },
+  async createSession(record: SessionRecord): Promise<void> {
+    const all = await readJson<SessionRecord[]>("sessions.json", []);
+    // One session per customer: a fresh login revokes older sessions and
+    // expired rows never linger.
+    const now = Date.now();
+    const keep = all.filter(
+      (r) => r.email !== record.email && new Date(r.expiresAt).getTime() > now
+    );
+    keep.push(record);
+    await writeJson("sessions.json", keep);
+  },
+  async findSession(token: string): Promise<SessionRecord | null> {
+    const all = await readJson<SessionRecord[]>("sessions.json", []);
+    const row = all.find((r) => r.token === token);
+    if (!row) return null;
+    if (new Date(row.expiresAt).getTime() <= Date.now()) return null;
+    return row;
+  },
+  async deleteSession(token: string): Promise<void> {
+    const all = await readJson<SessionRecord[]>("sessions.json", []);
+    await writeJson("sessions.json", all.filter((r) => r.token !== token));
+  },
+  async listCustomerOrders(email: string): Promise<CustomerOrderView[]> {
+    const orders = await readJson<CustomOrder[]>("custom-orders.json", []);
+    const items = await readJson<FulfillmentItem[]>("fulfillment.json", []);
+    const byOrder = new Map(items.map((i) => [i.orderId, i]));
+    return orders
+      .filter((o) => o.customerEmail.toLowerCase() === email)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .map((o): CustomerOrderView => {
+        const item = byOrder.get(o.id);
+        return {
+          id: o.id,
+          garment: o.garment,
+          status: o.status,
+          fulfillment: item
+            ? {
+                status: item.status,
+                printfulOrderId: item.printful?.printfulOrderId ?? null,
+              }
+            : null,
+          feeCents: o.feeCents,
+          createdAt: o.createdAt,
+          artworkUrl: o.artworkUrl,
+        };
+      });
+  },
 };
 
 // ---------- Postgres adapter ----------
@@ -377,6 +501,25 @@ async function runInit(): Promise<void> {
       worn_url TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE (design_url, garment)
+    )
+  `;
+  // Phase 5b: customer magic-code login. Codes are stored hashed; one
+  // statement per call (Neon HTTP driver).
+  await sql()`
+    CREATE TABLE IF NOT EXISTS td_login_codes (
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `;
+  await sql()`
+    CREATE TABLE IF NOT EXISTS td_sessions (
+      token TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL
     )
   `;
 }
@@ -639,6 +782,77 @@ const pgAdapter = {
     if (inserted.length) return rowToMockup(inserted[0]);
     return this.getMockup(record.designUrl, record.garment);
   },
+  // ---------- phase 5b customer auth ----------
+  async createLoginCode(record: LoginCodeRecord): Promise<void> {
+    await this.init();
+    await sql()`
+      INSERT INTO td_login_codes (email, code_hash, expires_at, used_at, created_at)
+      VALUES (${record.email}, ${record.codeHash}, ${record.expiresAt}::timestamptz,
+              ${record.usedAt}::timestamptz, ${record.createdAt}::timestamptz)
+    `;
+  },
+  async countRecentLoginCodes(email: string, sinceIso: string): Promise<number> {
+    await this.init();
+    const rows = await sql()`
+      SELECT count(*)::int AS n FROM td_login_codes
+      WHERE email = ${email} AND used_at IS NULL AND created_at >= ${sinceIso}::timestamptz
+    `;
+    return Number(rows[0]?.n ?? 0);
+  },
+  async findLatestLoginCode(email: string): Promise<LoginCodeRecord | null> {
+    await this.init();
+    const rows = await sql()`
+      SELECT email, code_hash, expires_at, used_at, created_at
+      FROM td_login_codes
+      WHERE email = ${email} AND used_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+    `;
+    return rows.length ? rowToLoginCode(rows[0]) : null;
+  },
+  async markLoginCodeUsed(email: string, codeHash: string): Promise<void> {
+    await this.init();
+    await sql()`
+      UPDATE td_login_codes SET used_at = now()
+      WHERE email = ${email} AND code_hash = ${codeHash} AND used_at IS NULL
+    `;
+  },
+  async createSession(record: SessionRecord): Promise<void> {
+    await this.init();
+    // One session per customer: a fresh login revokes older sessions.
+    await sql()`DELETE FROM td_sessions WHERE email = ${record.email}`;
+    await sql()`
+      INSERT INTO td_sessions (token, email, created_at, expires_at)
+      VALUES (${record.token}, ${record.email}, ${record.createdAt}::timestamptz,
+              ${record.expiresAt}::timestamptz)
+    `;
+  },
+  async findSession(token: string): Promise<SessionRecord | null> {
+    await this.init();
+    const rows = await sql()`
+      SELECT token, email, created_at, expires_at
+      FROM td_sessions
+      WHERE token = ${token} AND expires_at > now()
+      LIMIT 1
+    `;
+    return rows.length ? rowToSession(rows[0]) : null;
+  },
+  async deleteSession(token: string): Promise<void> {
+    await this.init();
+    await sql()`DELETE FROM td_sessions WHERE token = ${token}`;
+  },
+  async listCustomerOrders(email: string): Promise<CustomerOrderView[]> {
+    await this.init();
+    const rows = await sql()`
+      SELECT o.id, o.garment, o.status, o.fee_cents, o.created_at, o.artwork_url,
+             f.status AS fulfillment_status,
+             f.printful_order_id AS printful_order_id
+      FROM td_custom_orders o
+      LEFT JOIN td_fulfillment f ON f.order_id = o.id
+      WHERE lower(o.customer_email) = ${email}
+      ORDER BY o.created_at DESC
+    `;
+    return rows.map(rowToCustomerOrder);
+  },
 };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -731,6 +945,54 @@ function rowToMockup(r: AnyRow): MockupRecord {
         : String(r.created_at),
   };
 }
+function rowToLoginCode(r: AnyRow): LoginCodeRecord {
+  return {
+    email: String(r.email),
+    codeHash: String(r.code_hash),
+    expiresAt:
+      r.expires_at instanceof Date
+        ? r.expires_at.toISOString()
+        : String(r.expires_at),
+    usedAt:
+      r.used_at == null
+        ? null
+        : r.used_at instanceof Date
+          ? r.used_at.toISOString()
+          : String(r.used_at),
+    createdAt:
+      r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+  };
+}
+function rowToSession(r: AnyRow): SessionRecord {
+  return {
+    token: String(r.token),
+    email: String(r.email),
+    createdAt:
+      r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+    expiresAt:
+      r.expires_at instanceof Date ? r.expires_at.toISOString() : String(r.expires_at),
+  };
+}
+function rowToCustomerOrder(r: AnyRow): CustomerOrderView {
+  const fStatus = r.fulfillment_status;
+  const pfId = r.printful_order_id;
+  return {
+    id: String(r.id),
+    garment: r.garment === "hoodie" ? "hoodie" : "tee",
+    status: String(r.status),
+    fulfillment:
+      fStatus == null
+        ? null
+        : {
+            status: fStatus === "sent_to_printful" ? "sent_to_printful" : "queued",
+            printfulOrderId: pfId == null ? null : Number(pfId),
+          },
+    feeCents: Number(r.fee_cents),
+    createdAt:
+      r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+    artworkUrl: String(r.artwork_url),
+  };
+}
 
 // ---------- one interface, chosen per call ----------
 
@@ -802,4 +1064,44 @@ export const store = {
     usePostgres()
       ? pgAdapter.insertMockupIfAbsent(record)
       : fileAdapter.insertMockupIfAbsent(record),
+  // ---------- phase 5b customer auth ----------
+  /** Persist a hashed login code (10-min expiry handled by the caller). */
+  createLoginCode: (record: LoginCodeRecord) =>
+    usePostgres()
+      ? pgAdapter.createLoginCode(record)
+      : fileAdapter.createLoginCode(record),
+  /** Unused codes created since `sinceIso` for this email — rate-limit input. */
+  countRecentLoginCodes: (email: string, sinceIso: string) =>
+    usePostgres()
+      ? pgAdapter.countRecentLoginCodes(email, sinceIso)
+      : fileAdapter.countRecentLoginCodes(email, sinceIso),
+  /** Newest unused code row for this email, or null. */
+  findLatestLoginCode: (email: string) =>
+    usePostgres()
+      ? pgAdapter.findLatestLoginCode(email)
+      : fileAdapter.findLatestLoginCode(email),
+  /** Stamp used_at on the matching unused code row (single-use enforcement). */
+  markLoginCodeUsed: (email: string, codeHash: string) =>
+    usePostgres()
+      ? pgAdapter.markLoginCodeUsed(email, codeHash)
+      : fileAdapter.markLoginCodeUsed(email, codeHash),
+  /** Insert a session; older sessions for the same email are revoked. */
+  createSession: (record: SessionRecord) =>
+    usePostgres()
+      ? pgAdapter.createSession(record)
+      : fileAdapter.createSession(record),
+  /** Live (unexpired) session by token, or null. */
+  findSession: (token: string) =>
+    usePostgres()
+      ? pgAdapter.findSession(token)
+      : fileAdapter.findSession(token),
+  deleteSession: (token: string) =>
+    usePostgres()
+      ? pgAdapter.deleteSession(token)
+      : fileAdapter.deleteSession(token),
+  /** A customer's orders, newest first, joined with fulfillment status. */
+  listCustomerOrders: (email: string) =>
+    usePostgres()
+      ? pgAdapter.listCustomerOrders(email)
+      : fileAdapter.listCustomerOrders(email),
 };

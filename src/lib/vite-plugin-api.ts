@@ -62,6 +62,12 @@ export function threadDropApiPlugin(): Plugin {
             "content-type",
             result.contentType ?? "application/json"
           );
+          // Extra headers (phase 5b: Set-Cookie for the customer session).
+          if (result.headers) {
+            for (const [name, value] of Object.entries(result.headers)) {
+              res.setHeader(name, value);
+            }
+          }
           const body = result.body as string | Uint8Array | unknown;
           if (typeof body === "string") res.end(body);
           else if (body instanceof Uint8Array) res.end(body);

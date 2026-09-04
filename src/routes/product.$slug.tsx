@@ -88,12 +88,20 @@ function ProductPage() {
           <Link to="/" className="text-lg font-black tracking-tight">
             ThreadDrop
           </Link>
-          <Link
-            to="/custom"
-            className="rounded-full bg-neutral-900 px-4 py-2 text-sm font-semibold text-white active:bg-neutral-700"
-          >
-            Custom order
-          </Link>
+          <div className="flex items-center gap-3">
+            <Link
+              to="/account"
+              className="text-sm font-semibold text-neutral-600 hover:text-neutral-900"
+            >
+              My orders
+            </Link>
+            <Link
+              to="/custom"
+              className="rounded-full bg-neutral-900 px-4 py-2 text-sm font-semibold text-white active:bg-neutral-700"
+            >
+              Custom order
+            </Link>
+          </div>
         </div>
       </header>
       <div className="mx-auto max-w-5xl px-4 py-8 sm:px-6">

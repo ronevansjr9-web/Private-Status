@@ -11,6 +11,16 @@ import { join } from "node:path";
 import { store, CONFIG_KEYS, isPostgresMode, type ShippingAddress } from "~/lib/store";
 import { queueSubmittedCustomOrders } from "~/lib/fulfillment";
 import {
+  requestCode,
+  verifyCode,
+  destroySession,
+  sessionEmailForRequest,
+  sessionTokenFromRequest,
+  sessionCookie,
+  clearSessionCookie,
+  SESSION_COOKIE,
+} from "~/lib/auth";
+import {
   createStoreOrder,
   resolveKey,
   resolveVariantMap,
@@ -28,12 +38,23 @@ export interface ApiResult {
   body: unknown;
   /** Optional content-type override (both wirings default to application/json). */
   contentType?: string;
+  /**
+   * Optional extra response headers (phase 5b: Set-Cookie for the session).
+   * Both wirings apply these after content-type.
+   */
+  headers?: Record<string, string>;
 }
 
 const json = (status: number, body: unknown): ApiResult => ({
   status,
   body: JSON.stringify(body),
 });
+/** json() with extra response headers (Set-Cookie for the session, phase 5b). */
+const jsonWithHeaders = (
+  status: number,
+  body: unknown,
+  headers: Record<string, string>
+): ApiResult => ({ status, body: JSON.stringify(body), headers });
 
 const ALLOWED_IMAGE_TYPES: Record<string, string> = {
   "image/png": "png",
@@ -399,6 +420,67 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
     if (req.method === "POST" && pathname === "/api/fulfillment/queue") {
       const result = await queueSubmittedCustomOrders();
       return json(200, { queued: result.queued, queuedAt: result.queuedAt });
+    }
+
+    // ---------- customer auth (phase 5b) ----------
+    // POST /api/auth/request-code — {email}. Always {ok:true} on success (no
+    // account enumeration). delivery:"unconfigured" means no Knock key yet —
+    // the UI shows "email delivery coming soon"; the code is still stored so
+    // the flow can be verified once delivery goes live.
+    // 429 = rate limited (max 3 codes per email per 15 min).
+    if (req.method === "POST" && pathname === "/api/auth/request-code") {
+      let raw: Record<string, unknown>;
+      try {
+        raw = (await req.json()) as Record<string, unknown>;
+      } catch {
+        return json(400, { ok: false, error: "invalid_body" });
+      }
+      const result = await requestCode(String(raw?.email ?? ""));
+      return json(result.status, result.body);
+    }
+    // POST /api/auth/verify — {email, code}. On success sets the session
+    // cookie (httpOnly, Secure, SameSite=Lax, path=/) and returns {ok:true,
+    // email}. Wrong/expired/used code -> 401 {ok:false, error:"invalid"}.
+    if (req.method === "POST" && pathname === "/api/auth/verify") {
+      let raw: Record<string, unknown>;
+      try {
+        raw = (await req.json()) as Record<string, unknown>;
+      } catch {
+        return json(400, { ok: false, error: "invalid_body" });
+      }
+      const email = String(raw?.email ?? "");
+      const result = await verifyCode(email, String(raw?.code ?? ""));
+      if (!result.ok || !result.token) {
+        return json(401, { ok: false, error: result.error ?? "invalid" });
+      }
+      // 30 days, matching the server-side session expiry.
+      return jsonWithHeaders(
+        200,
+        { ok: true, email: email.trim().toLowerCase() },
+        { "set-cookie": sessionCookie(result.token, 30 * 24 * 60 * 60) }
+      );
+    }
+    // POST /api/auth/logout — deletes the server session and clears the
+    // cookie. Idempotent: works even without a valid session.
+    if (req.method === "POST" && pathname === "/api/auth/logout") {
+      const token = sessionTokenFromRequest(req);
+      if (token) await destroySession(token);
+      return jsonWithHeaders(200, { ok: true }, { "set-cookie": clearSessionCookie() });
+    }
+    // GET /api/auth/me — who am I? 200 {ok,email} with a live session cookie,
+    // 401 when anonymous or the session expired.
+    if (req.method === "GET" && pathname === "/api/auth/me") {
+      const email = await sessionEmailForRequest(req);
+      if (!email) return json(401, { ok: false, error: "unauthenticated" });
+      return json(200, { ok: true, email });
+    }
+    // GET /api/my/orders — the logged-in customer's custom orders, newest
+    // first, joined with fulfillment status. 401 without a valid session.
+    if (req.method === "GET" && pathname === "/api/my/orders") {
+      const email = await sessionEmailForRequest(req);
+      if (!email) return json(401, { ok: false, error: "unauthenticated" });
+      const orders = await store.listCustomerOrders(email);
+      return json(200, { ok: true, email, orders });
     }
 
     // ---------- owner endpoints ----------
