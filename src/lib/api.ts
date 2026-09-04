@@ -744,6 +744,61 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
         });
       }
 
+      // POST /api/owner/fulfillment/sync - phase 4b status sync. For every
+      // sent_to_printful row, GET /orders/{printfulOrderId} and refresh the
+      // stored printful_status. Rows already in a final state are skipped
+      // (no wasted API calls). Per-row Printful failures (e.g. 404 for an
+      // order deleted at Printful) are reported per item in the response,
+      // never thrown - one bad row cannot fail the whole sync. Returns the
+      // refreshed queue list.
+      if (req.method === "POST" && pathname === "/api/owner/fulfillment/sync") {
+        const items = await store.listFulfillmentItems();
+        const refreshed: Array<{
+          orderId: string;
+          printfulOrderId: number | null;
+          printfulStatus: string | null;
+          error: string | null;
+        }> = [];
+        for (const item of items) {
+          if (item.status !== "sent_to_printful" || !item.printful) continue;
+          const pfId = item.printful.printfulOrderId;
+          try {
+            const order = await getPrintfulOrder(pfId);
+            const mapped = mapPrintfulStatus(order.status);
+            if (mapped !== item.printful.printfulStatus) {
+              await store.updateFulfillmentStatus(item.orderId, {
+                status: "sent_to_printful",
+                printful: {
+                  printfulOrderId: pfId,
+                  printfulStatus: mapped,
+                  fulfilledAt: item.printful.fulfilledAt,
+                },
+              });
+            }
+            refreshed.push({
+              orderId: item.orderId,
+              printfulOrderId: pfId,
+              printfulStatus: mapped,
+              error: null,
+            });
+          } catch (err) {
+            const msg =
+              err instanceof Error ? err.message : "Printful request failed";
+            refreshed.push({
+              orderId: item.orderId,
+              printfulOrderId: pfId,
+              printfulStatus: null,
+              error: msg,
+            });
+          }
+        }
+        return json(200, {
+          syncedAt: new Date().toISOString(),
+          synced: refreshed.length,
+          refreshed,
+          items: await store.listFulfillmentItems(),
+        });
+      }
       // POST /api/owner/fulfillment/<orderId>/printful — phase 4b one-click
       // fulfillment. Creates a REAL order at Printful (draft + confirm) for
       // the fulfillment row's custom order. Guards, in order:
@@ -837,61 +892,6 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       return json(404, { error: "Not found" });
     }
 
-      // POST /api/owner/fulfillment/sync - phase 4b status sync. For every
-      // sent_to_printful row, GET /orders/{printfulOrderId} and refresh the
-      // stored printful_status. Rows already in a final state are skipped
-      // (no wasted API calls). Per-row Printful failures (e.g. 404 for an
-      // order deleted at Printful) are reported per item in the response,
-      // never thrown - one bad row cannot fail the whole sync. Returns the
-      // refreshed queue list.
-      if (req.method === "POST" && pathname === "/api/owner/fulfillment/sync") {
-        const items = await store.listFulfillmentItems();
-        const refreshed: Array<{
-          orderId: string;
-          printfulOrderId: number | null;
-          printfulStatus: string | null;
-          error: string | null;
-        }> = [];
-        for (const item of items) {
-          if (item.status !== "sent_to_printful" || !item.printful) continue;
-          const pfId = item.printful.printfulOrderId;
-          try {
-            const order = await getPrintfulOrder(pfId);
-            const mapped = mapPrintfulStatus(order.status);
-            if (mapped !== item.printful.printfulStatus) {
-              await store.updateFulfillmentStatus(item.orderId, {
-                status: "sent_to_printful",
-                printful: {
-                  printfulOrderId: pfId,
-                  printfulStatus: mapped,
-                  fulfilledAt: item.printful.fulfilledAt,
-                },
-              });
-            }
-            refreshed.push({
-              orderId: item.orderId,
-              printfulOrderId: pfId,
-              printfulStatus: mapped,
-              error: null,
-            });
-          } catch (err) {
-            const msg =
-              err instanceof Error ? err.message : "Printful request failed";
-            refreshed.push({
-              orderId: item.orderId,
-              printfulOrderId: pfId,
-              printfulStatus: null,
-              error: msg,
-            });
-          }
-        }
-        return json(200, {
-          syncedAt: new Date().toISOString(),
-          synced: refreshed.length,
-          refreshed,
-          items: await store.listFulfillmentItems(),
-        });
-      }
     return json(404, { error: "Not found" });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal error";

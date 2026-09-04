@@ -249,6 +249,15 @@ export async function createStoreOrder(
     throw new Error("Printful order creation returned no order id");
   }
 
+  // TEST-ONLY SEAM (phase 4b verification): when PRINTFUL_DRAFT_ONLY=1 the
+  // confirm step is skipped, so the call creates a cancellable DRAFT order
+  // and returns it with status "draft". Lets the verify pipeline prove the
+  // real POST /orders path end to end without ever approving production.
+  // NEVER set this env in production.
+  if (process.env.PRINTFUL_DRAFT_ONLY === "1") {
+    return { printfulOrderId, status: "draft" };
+  }
+
   // 2. Confirm it for fulfillment.
   try {
     const confirmed = (await pf(`/orders/${printfulOrderId}/confirm`, {
