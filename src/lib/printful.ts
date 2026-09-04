@@ -269,6 +269,30 @@ export async function createStoreOrder(
   }
 }
 
+/** Minimal view of a stored Printful order, from GET /orders/{id}. */
+export interface PrintfulOrderView {
+  id: number;
+  /** Printful's raw status string (e.g. "draft", "pending", "canceled"). */
+  status: string;
+}
+
+/**
+ * Fetch one store order (GET /orders/{id}, X-PF-Store-Id) — the read side of
+ * phase 4b, used by the owner status-sync endpoint. Throws Error("Printful
+ * <status>: <reason>") on failure (404 for an unknown/deleted order id).
+ */
+export async function getPrintfulOrder(
+  printfulOrderId: number
+): Promise<PrintfulOrderView> {
+  const result = (await pf(`/orders/${printfulOrderId}`, {
+    withStore: true,
+  })) as { id?: number; status?: string } | null;
+  return {
+    id: typeof result?.id === "number" ? result.id : printfulOrderId,
+    status: typeof result?.status === "string" ? result.status : "unknown",
+  };
+}
+
 /**
  * Garment → catalog-variant mapping. Resolution order (same pattern as
  * payments.ts): Postgres mode prefers the config key 'printfulVariants'

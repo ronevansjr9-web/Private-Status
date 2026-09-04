@@ -198,6 +198,37 @@ function OwnerPage() {
       prev.map((it) => (it.orderId === updated.orderId ? updated : it))
     );
   }, []);
+  // Pull fresh Printful statuses for every sent order (phase 4b status sync),
+  // then reload the queue panel so the badges update in place.
+  const syncStatuses = useCallback(async () => {
+    if (!key) return;
+    setSyncing(true);
+    setSyncMsg(null);
+    try {
+      const res = await fetch("/api/owner/fulfillment/sync", {
+        method: "POST",
+        headers: { "X-Owner-Key": key },
+      });
+      const data = (await res.json().catch(() => null)) as
+        | { synced?: number; error?: string }
+        | null;
+      if (!res.ok) {
+        setSyncMsg(data?.error ?? `Status sync failed (${res.status}).`);
+        return;
+      }
+      const n = data?.synced ?? 0;
+      setSyncMsg(
+        n === 0
+          ? "Nothing to sync - no orders sent to Printful yet."
+          : `Synced ${n} order${n === 1 ? "" : "s"} from Printful.`
+      );
+      await loadFulfillment(key);
+    } catch {
+      setSyncMsg("Could not reach the status-sync endpoint.");
+    } finally {
+      setSyncing(false);
+    }
+  }, [key, loadFulfillment]);
 
   useEffect(() => {
     if (key) void loadAll(key);
@@ -267,6 +298,7 @@ function OwnerPage() {
       products={products}
       orders={orders}
       fulfillment={fulfillment}
+      syncStatuses={syncStatuses}
       queueForFulfillment={queueForFulfillment}
       queuing={queuing}
       queueMsg={queueMsg}
@@ -303,6 +335,7 @@ function Dashboard(props: {
   products: Product[];
   orders: CustomOrder[];
   fulfillment: FulfillmentItem[];
+  syncStatuses: () => Promise<void>;
   queueForFulfillment: () => Promise<void>;
   queuing: boolean;
   queueMsg: string | null;
@@ -317,6 +350,7 @@ function Dashboard(props: {
     products,
     orders,
     fulfillment,
+    syncStatuses,
     queueForFulfillment,
     queuing,
     queueMsg,
@@ -346,13 +380,16 @@ function Dashboard(props: {
   const [pfBusy, setPfBusy] = useState<string | null>(null);
   const [pfError, setPfError] = useState<string | null>(null);
   const [pfErrorMsg, setPfErrorMsg] = useState<string | null>(null);
+  // "Refresh statuses" state (phase 4b sync button in the queue panel).
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState<string | null>(null);
 
   const fulfillViaPrintful = useCallback(
     async (orderId: string) => {
       // Real order ahead — require an explicit confirmation click first.
       if (
         !window.confirm(
-          "Create a real print order at Printful?"
+          "This sends a REAL order to Printful and starts production - it cannot be undone here. Send it?"
         )
       ) {
         return;
@@ -751,22 +788,31 @@ function Dashboard(props: {
                 {fulfillment.length}
               </span>
             </h2>
-            <button
-              onClick={() => void queueForFulfillment()}
-              disabled={queuing}
-              className="shrink-0 rounded-full bg-neutral-900 px-4 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
-            >
-              {queuing ? "Queueing…" : "Queue for fulfillment"}
-            </button>
+            <div className="flex shrink-0 items-center gap-2">
+              <button
+                onClick={() => void syncStatuses()}
+                disabled={syncing}
+                className="rounded-full border border-neutral-300 bg-white px-4 py-1.5 text-xs font-semibold text-neutral-700 disabled:opacity-40"
+              >
+                {syncing ? "Refreshing…" : "Refresh statuses"}
+              </button>
+              <button
+                onClick={() => void queueForFulfillment()}
+                disabled={queuing}
+                className="rounded-full bg-neutral-900 px-4 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
+              >
+                {queuing ? "Queueing…" : "Queue for fulfillment"}
+              </button>
+            </div>
           </div>
           <p className="mt-1 text-xs text-neutral-500">
             Custom orders waiting for the print partner. Queueing is idempotent —
             already-queued orders are skipped. &ldquo;Fulfill via Printful&rdquo;
             creates a real print order (confirm before clicking).
           </p>
-          {queueMsg && (
-            <p className="mt-2 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-2 text-sm text-neutral-700">
-              {queueMsg}
+          {(queueMsg || syncMsg) && (
+            <p className="mt-3 rounded-lg bg-neutral-100 px-3 py-2 text-xs text-neutral-700">
+              {queueMsg || syncMsg}
             </p>
           )}
           {fulfillment.length === 0 ? (
@@ -822,19 +868,21 @@ function Dashboard(props: {
                         </td>
                         <td className="py-2 pr-3">
                           {sent ? (
-                            <span className="rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-bold text-green-800">
-                              sent_to_printful
-                            </span>
+                            <>
+                              <span className="rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-bold text-green-800">
+                                sent_to_printful
+                              </span>
+                              <span className="mt-1 inline-block rounded-full bg-neutral-900 px-2.5 py-0.5 text-xs font-bold text-white">
+                                {f.printful?.printfulStatus}
+                              </span>
+                              <p className="mt-1 text-xs text-neutral-500">
+                                Printful #{f.printful?.printfulOrderId}
+                              </p>
+                            </>
                           ) : (
                             <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-bold text-blue-800">
-                              {f.status}
+                              In queue
                             </span>
-                          )}
-                          {sent && (
-                            <p className="mt-1 text-xs text-neutral-500">
-                              Printful #{f.printful?.printfulOrderId} ·{" "}
-                              {f.printful?.printfulStatus}
-                            </p>
                           )}
                         </td>
                         <td className="py-2">

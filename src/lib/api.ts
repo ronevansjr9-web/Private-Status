@@ -22,9 +22,11 @@ import {
 } from "~/lib/auth";
 import {
   createStoreOrder,
+  getPrintfulOrder,
   resolveKey,
   resolveVariantMap,
 } from "~/lib/printful";
+import type { MockupRecord } from "~/lib/store";
 import {
   defaultDesignName,
   describeDesign,
@@ -212,6 +214,21 @@ async function ownerAuth(req: Request, bodyKey?: unknown): Promise<ApiResult | n
   return null;
 }
 
+/**
+ * Bucket Printful's raw order status into the five canonical fulfillment
+ * statuses the owner dashboard shows: draft / pending / processing /
+ * fulfilled / cancelled. Unrecognized in-flight statuses (onhold,
+ * needs_attention, failed, ...) land in "processing" - they are still in
+ * Printful's hands, not shipped and not cancelled.
+ */
+export function mapPrintfulStatus(raw: string): string {
+  const s = raw.toLowerCase();
+  if (s === "draft") return "draft";
+  if (s === "pending") return "pending";
+  if (s === "fulfilled" || s === "archived") return "fulfilled";
+  if (s === "canceled" || s === "cancelled") return "cancelled";
+  return "processing";
+}
 function bearerToken(req: Request): string | null {
   const h = req.headers.get("authorization");
   if (!h) return null;
@@ -745,11 +762,15 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
         }
 
         // Idempotency guard: never create a second Printful order for a row
-        // that already went out. Report the recorded state instead.
+        // that already went out. 409 Conflict — the row is not re-ordered and
+        // the recorded Printful trace comes back so a stale dashboard can
+        // reconcile instead of retrying.
         if (item.status === "sent_to_printful" && item.printful) {
-          return json(200, {
-            ok: true,
-            idempotent: true,
+          return json(409, {
+            error:
+              "This order was already sent to Printful (order #" +
+              item.printful.printfulOrderId +
+              "). It will not be ordered twice — use Refresh statuses to update it.",
             item,
           });
         }
@@ -774,11 +795,23 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
           });
         }
 
+        // Print-order file: the cached garment mockup for this design +
+        // garment (the composed, printable render). Generated via the Printful
+        // mockup generator and re-hosted on CloudFront when not cached yet.
+        // Falls back to the raw design image when mockup generation fails -
+        // the design itself is still a valid print file.
+        let mockup: MockupRecord | null = null;
+        try {
+          mockup = await getOrGenerateMockups(order.artworkUrl, item.garment);
+        } catch {
+          mockup = null;
+        }
+        const fileUrl = mockup?.flatUrl || mockup?.wornUrl || order.artworkUrl;
         try {
           const result = await createStoreOrder({
             orderId,
             garment: item.garment,
-            artworkUrl: order.artworkUrl,
+            artworkUrl: fileUrl,
             shipping: order.shipping as ShippingAddress,
           });
           const updated = await store.updateFulfillmentStatus(orderId, {
@@ -804,6 +837,61 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
       return json(404, { error: "Not found" });
     }
 
+      // POST /api/owner/fulfillment/sync - phase 4b status sync. For every
+      // sent_to_printful row, GET /orders/{printfulOrderId} and refresh the
+      // stored printful_status. Rows already in a final state are skipped
+      // (no wasted API calls). Per-row Printful failures (e.g. 404 for an
+      // order deleted at Printful) are reported per item in the response,
+      // never thrown - one bad row cannot fail the whole sync. Returns the
+      // refreshed queue list.
+      if (req.method === "POST" && pathname === "/api/owner/fulfillment/sync") {
+        const items = await store.listFulfillmentItems();
+        const refreshed: Array<{
+          orderId: string;
+          printfulOrderId: number | null;
+          printfulStatus: string | null;
+          error: string | null;
+        }> = [];
+        for (const item of items) {
+          if (item.status !== "sent_to_printful" || !item.printful) continue;
+          const pfId = item.printful.printfulOrderId;
+          try {
+            const order = await getPrintfulOrder(pfId);
+            const mapped = mapPrintfulStatus(order.status);
+            if (mapped !== item.printful.printfulStatus) {
+              await store.updateFulfillmentStatus(item.orderId, {
+                status: "sent_to_printful",
+                printful: {
+                  printfulOrderId: pfId,
+                  printfulStatus: mapped,
+                  fulfilledAt: item.printful.fulfilledAt,
+                },
+              });
+            }
+            refreshed.push({
+              orderId: item.orderId,
+              printfulOrderId: pfId,
+              printfulStatus: mapped,
+              error: null,
+            });
+          } catch (err) {
+            const msg =
+              err instanceof Error ? err.message : "Printful request failed";
+            refreshed.push({
+              orderId: item.orderId,
+              printfulOrderId: pfId,
+              printfulStatus: null,
+              error: msg,
+            });
+          }
+        }
+        return json(200, {
+          syncedAt: new Date().toISOString(),
+          synced: refreshed.length,
+          refreshed,
+          items: await store.listFulfillmentItems(),
+        });
+      }
     return json(404, { error: "Not found" });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal error";
