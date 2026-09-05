@@ -9,7 +9,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { store, CONFIG_KEYS, isPostgresMode, type ShippingAddress } from "~/lib/store";
-import { queueSubmittedCustomOrders } from "~/lib/fulfillment";
+import { queueSubmittedCustomOrders, notifyProductionStarted } from "~/lib/fulfillment";
 import {
   requestCode,
   verifyCode,
@@ -432,11 +432,16 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
     }
 
     // POST /api/fulfillment/queue — push every 'submitted' custom order into
-    // the fulfillment queue. Returns {queued, queuedAt} (idempotent: orders
-    // already queued are skipped).
+    // the fulfillment queue. Returns {queued, queuedAt, emails} (idempotent:
+    // orders already queued are skipped). emails = per-order confirmation
+    // email outcome (phase 5c) — reported, never allowed to fail the queue.
     if (req.method === "POST" && pathname === "/api/fulfillment/queue") {
       const result = await queueSubmittedCustomOrders();
-      return json(200, { queued: result.queued, queuedAt: result.queuedAt });
+      return json(200, {
+        queued: result.queued,
+        queuedAt: result.queuedAt,
+        emails: result.emails ?? [],
+      });
     }
 
     // ---------- customer auth (phase 5b) ----------
@@ -877,7 +882,27 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
               fulfilledAt: new Date().toISOString(),
             },
           });
-          return json(200, { ok: true, idempotent: false, item: updated });
+          // Phase 5c hook (b): the order just entered production at Printful.
+          // Best-effort email to the customer, guarded by the atomic
+          // production_notified_at claim — a failure here is reported in the
+          // response payload but NEVER fails the fulfillment (already done).
+          let email: { orderId: string; delivery: string; reason?: string } | null = null;
+          try {
+            email = await notifyProductionStarted(updated ?? item);
+          } catch {
+            email = null;
+          }
+          // Re-read so the panel gets the row WITH the email guard stamps
+          // (they are written by the notify path, after the update above).
+          const fresh = email
+            ? await store.getFulfillmentItem(orderId).catch(() => null)
+            : null;
+          return json(200, {
+            ok: true,
+            idempotent: false,
+            item: fresh ?? updated,
+            ...(email ? { email } : {}),
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : "Printful request failed";
           // Printful errors look like "Printful <status>: <message>" — keep

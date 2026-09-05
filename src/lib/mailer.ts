@@ -1,9 +1,13 @@
-// ThreadDrop email delivery (phase 5b) — Knock (https://knock.app) seam.
+// ThreadDrop email delivery (phases 5b + 5c) — Knock (https://knock.app) seam.
 //
-// The customer login flow sends a 6-digit magic code by email. Delivery goes
-// through Knock's REST API, triggered server-side only (the signing key, if
+// Three transactional workflows, all triggered server-side only:
+//   - magic-code          login codes (phase 5b)
+//   - order-confirmation  paid custom order acknowledged (phase 5c)
+//   - order-in-production order entered production at Printful (phase 5c)
+// No marketing, no bulk — every recipient is a customer in a live
+// transaction. Delivery goes through Knock's REST API. The signing key, if
 // ever needed for embedded in-app notification feeds, is resolved here too but
-// never leaves the server).
+// never leaves the server.
 //
 // Credentials resolve in order:
 //   1. Environment: KNOCK_API_KEY / KNOCK_SIGNING_KEY (sandbox + published host)
@@ -32,8 +36,10 @@
 import { store, CONFIG_KEYS } from "~/lib/store";
 
 const KNOCK_API_BASE = "https://api.knock.app/v1";
-/** Workflow key the owner will create in their Knock dashboard. */
+/** Workflow keys the owner will create in their Knock dashboard (phase 5c). */
 export const KNOCK_MAGIC_CODE_WORKFLOW = "magic-code";
+export const KNOCK_ORDER_CONFIRMATION_WORKFLOW = "order-confirmation";
+export const KNOCK_PRODUCTION_STARTED_WORKFLOW = "order-in-production";
 
 export interface MailDelivery {
   sent: boolean;
@@ -60,10 +66,15 @@ export async function resolveKnockSigningKey(): Promise<string | null> {
 }
 
 /**
- * Email a 6-digit magic login code. Never throws — the caller always gets a
- * structured result and the login flow must not leak whether the email exists.
+ * Shared Knock trigger. One HTTP call shape for every workflow: Bearer auth,
+ * {recipients:[email], data:{...}}, 10s timeout, structured result — never
+ * throws, never echoes the key or the full response body upstream.
  */
-export async function sendMagicCode(email: string, code: string): Promise<MailDelivery> {
+async function triggerWorkflow(
+  workflowKey: string,
+  email: string,
+  data: Record<string, unknown>
+): Promise<MailDelivery> {
   let apiKey: string | null = null;
   try {
     apiKey = await resolveKnockApiKey();
@@ -76,28 +87,22 @@ export async function sendMagicCode(email: string, code: string): Promise<MailDe
   }
 
   try {
-    const res = await fetch(
-      `${KNOCK_API_BASE}/workflows/${KNOCK_MAGIC_CODE_WORKFLOW}/trigger`,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${apiKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          // Knock accepts a plain email string as an inline recipient — no
-          // pre-registered Knock user object required.
-          recipients: [email],
-          data: {
-            code,
-            // Common template variables; harmless if the workflow ignores them.
-            expires_in_minutes: 10,
-          },
-        }),
-        // Codes are short-lived — don't hang the request on a slow API.
-        signal: AbortSignal.timeout(10_000),
-      }
-    );
+    const res = await fetch(`${KNOCK_API_BASE}/workflows/${workflowKey}/trigger`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        // Knock accepts a plain email string as an inline recipient — no
+        // pre-registered Knock user object required.
+        recipients: [email],
+        data,
+      }),
+      // Emails are transactional and time-sensitive — don't hang the caller
+      // (a checkout/fulfillment path) on a slow API.
+      signal: AbortSignal.timeout(10_000),
+    });
 
     if (!res.ok) {
       // Known Knock error shape: { code, message, ... }; keep the status and
@@ -137,4 +142,49 @@ export async function sendMagicCode(email: string, code: string): Promise<MailDe
       err instanceof Error && err.name === "TimeoutError" ? "timeout" : "network_error";
     return { sent: false, reason };
   }
+}
+
+/**
+ * Email a 6-digit magic login code. Never throws — the caller always gets a
+ * structured result and the login flow must not leak whether the email exists.
+ */
+export async function sendMagicCode(email: string, code: string): Promise<MailDelivery> {
+  return triggerWorkflow(KNOCK_MAGIC_CODE_WORKFLOW, email, {
+    code,
+    // Common template variables; harmless if the workflow ignores them.
+    expires_in_minutes: 10,
+  });
+}
+
+/**
+ * Email the order confirmation for a paid custom order (phase 5c). Never
+ * throws — the payment/queue flow must complete even if delivery fails.
+ */
+export async function sendOrderConfirmation(
+  email: string,
+  payload: { orderId: string; garment: string; feeCents: number; orderUrl: string }
+): Promise<MailDelivery> {
+  return triggerWorkflow(KNOCK_ORDER_CONFIRMATION_WORKFLOW, email, {
+    order_id: payload.orderId,
+    garment: payload.garment,
+    fee_cents: payload.feeCents,
+    fee_usd: (payload.feeCents / 100).toFixed(2),
+    order_url: payload.orderUrl,
+  });
+}
+
+/**
+ * Email the customer when their order enters production at Printful (phase
+ * 5c). Never throws — the fulfillment flow must complete even if delivery
+ * fails.
+ */
+export async function sendProductionStarted(
+  email: string,
+  payload: { orderId: string; garment: string; printfulStatus: string }
+): Promise<MailDelivery> {
+  return triggerWorkflow(KNOCK_PRODUCTION_STARTED_WORKFLOW, email, {
+    order_id: payload.orderId,
+    garment: payload.garment,
+    printful_status: payload.printfulStatus,
+  });
 }

@@ -54,6 +54,37 @@ function shipToLine(o: CustomOrder | undefined): string {
   return [s.city, s.state, s.country.toUpperCase()].filter(Boolean).join(", ");
 }
 
+/**
+ * Phase 5c: subtle per-row email status in the fulfillment queue panel.
+ * production_notified_at set = one send attempt happened. The stamped result
+ * distinguishes "sent ✓" from a short failure reason ("unconfigured" is the
+ * expected display until the owner's two Knock steps land).
+ */
+function productionEmailLine(f: FulfillmentItem) {
+  // Only meaningful once the row is in production; queued rows are silent.
+  if (f.status !== "sent_to_printful") return null;
+  if (!f.productionNotifiedAt) {
+    return (
+      <p className="mt-1 text-xs text-neutral-400">
+        email pending (unconfigured)
+      </p>
+    );
+  }
+  const result = f.productionNotifyResult;
+  if (result === "sent") {
+    return (
+      <p className="mt-1 text-xs text-neutral-400" title={`Attempted ${f.productionNotifiedAt}`}>
+        email sent ✓
+      </p>
+    );
+  }
+  return (
+    <p className="mt-1 text-xs text-neutral-400" title={`Attempted ${f.productionNotifiedAt}`}>
+      email failed ({result ?? "unknown"})
+    </p>
+  );
+}
+
 interface FulfillmentItem {
   orderId: string;
   type: string;
@@ -68,6 +99,10 @@ interface FulfillmentItem {
     printfulStatus: string;
     fulfilledAt: string;
   };
+  /** Phase 5c: production-started email guard stamp (null = not attempted). */
+  productionNotifiedAt?: string | null;
+  /** Phase 5c: short mailer outcome ("sent" or short failure reason). */
+  productionNotifyResult?: string | null;
 }
 
 function OwnerPage() {
@@ -878,6 +913,7 @@ function Dashboard(props: {
                               <p className="mt-1 text-xs text-neutral-500">
                                 Printful #{f.printful?.printfulOrderId}
                               </p>
+                              {productionEmailLine(f)}
                             </>
                           ) : (
                             <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-bold text-blue-800">

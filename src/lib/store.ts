@@ -60,6 +60,11 @@ export interface CustomOrder {
   createdAt: string;
   /** Present only when the customer filled the optional shipping section. */
   shipping?: ShippingAddress;
+  /**
+   * Phase 5c double-send guard: stamped when the order-confirmation email has
+   * been attempted for this order. A timestamp means "never email again".
+   */
+  confirmationSentAt?: string | null;
 }
 
 export interface Settings {
@@ -97,6 +102,16 @@ export interface FulfillmentItem {
   queuedAt: string;
   /** Present once the one-click "Fulfill via Printful" succeeded. */
   printful?: FulfillmentPrintfulInfo;
+  /**
+   * Phase 5c double-send guard: stamped when the production-started email has
+   * been attempted for this row. A timestamp means "never email again".
+   */
+  productionNotifiedAt?: string | null;
+  /**
+   * Phase 5c short mailer outcome for the owner panel: "sent" or a short
+   * failure reason (e.g. "unconfigured"). Never contains payload bodies.
+   */
+  productionNotifyResult?: string | null;
 }
 
 /**
@@ -293,6 +308,33 @@ const fileAdapter = {
   async getFulfillmentItem(orderId: string): Promise<FulfillmentItem | null> {
     const items = await readJson<FulfillmentItem[]>("fulfillment.json", []);
     return items.find((i) => i.orderId === orderId) ?? null;
+  },
+  // ---------- phase 5c email double-send guards (file adapter) ----------
+  // Same contract as the Postgres versions: a row back = this caller won the
+  // send; null = the guard was already set (or the record is gone).
+  async claimOrderConfirmation(orderId: string): Promise<CustomOrder | null> {
+    const orders = await readJson<CustomOrder[]>("custom-orders.json", []);
+    const order = orders.find((o) => o.id === orderId);
+    if (!order || order.confirmationSentAt) return null;
+    order.confirmationSentAt = new Date().toISOString();
+    await writeJson("custom-orders.json", orders);
+    return order;
+  },
+  async claimProductionNotification(orderId: string): Promise<FulfillmentItem | null> {
+    const items = await readJson<FulfillmentItem[]>("fulfillment.json", []);
+    const item = items.find((i) => i.orderId === orderId);
+    if (!item || item.productionNotifiedAt) return null;
+    item.productionNotifiedAt = new Date().toISOString();
+    await writeJson("fulfillment.json", items);
+    return item;
+  },
+  /** Phase 5c: stamp the short mailer outcome for the owner panel. */
+  async setProductionNotifyResult(orderId: string, result: string): Promise<void> {
+    const items = await readJson<FulfillmentItem[]>("fulfillment.json", []);
+    const item = items.find((i) => i.orderId === orderId);
+    if (!item) return;
+    item.productionNotifyResult = result.slice(0, 120);
+    await writeJson("fulfillment.json", items);
   },
   // ---------- phase 5a mockup cache (file adapter: data/mockups.json) ----------
   async getMockup(designUrl: string, garment: Garment): Promise<MockupRecord | null> {
@@ -522,6 +564,17 @@ async function runInit(): Promise<void> {
       expires_at TIMESTAMPTZ NOT NULL
     )
   `;
+  // Phase 5c: email double-send guards. Idempotent ADD COLUMN for tables that
+  // predate them. A non-null timestamp means "already attempted — never again".
+  await sql()`
+    ALTER TABLE td_custom_orders ADD COLUMN IF NOT EXISTS confirmation_sent_at TIMESTAMPTZ
+  `;
+  await sql()`
+    ALTER TABLE td_fulfillment ADD COLUMN IF NOT EXISTS production_notified_at TIMESTAMPTZ
+  `;
+  await sql()`
+    ALTER TABLE td_fulfillment ADD COLUMN IF NOT EXISTS production_notify_result TEXT
+  `;
 }
 
 const pgAdapter = {
@@ -629,7 +682,7 @@ const pgAdapter = {
     await this.init();
     const rows = await sql()`
       SELECT id, artwork_url, garment, notes, customer_email,
-             fee_cents, status, created_at, shipping
+             fee_cents, status, created_at, shipping, confirmation_sent_at
       FROM td_custom_orders ORDER BY created_at DESC
     `;
     return rows.map(rowToOrder);
@@ -676,7 +729,8 @@ const pgAdapter = {
     const rows = await sql()`
       SELECT order_id, type, garment, artwork_url, customer_email,
              fee_cents, status, queued_at, printful_order_id,
-             printful_status, fulfilled_at
+             printful_status, fulfilled_at, production_notified_at,
+             production_notify_result
       FROM td_fulfillment ORDER BY queued_at DESC
     `;
     return rows.map(rowToFulfillment);
@@ -713,7 +767,8 @@ const pgAdapter = {
     const rows = await sql()`
       SELECT order_id, type, garment, artwork_url, customer_email,
              fee_cents, status, queued_at, printful_order_id,
-             printful_status, fulfilled_at
+             printful_status, fulfilled_at, production_notified_at,
+             production_notify_result
       FROM td_fulfillment WHERE order_id = ${orderId} LIMIT 1
     `;
     return rows.length ? rowToFulfillment(rows[0]) : null;
@@ -737,9 +792,63 @@ const pgAdapter = {
       WHERE order_id = ${orderId}
       RETURNING order_id, type, garment, artwork_url, customer_email,
                 fee_cents, status, queued_at, printful_order_id,
-                printful_status, fulfilled_at
+                printful_status, fulfilled_at, production_notified_at,
+                production_notify_result
     `;
     return rows.length ? rowToFulfillment(rows[0]) : null;
+  },
+
+  /**
+   * Phase 5c double-send guard for the order-confirmation email. Atomically
+   * sets confirmation_sent_at only when it is still NULL and returns the
+   * affected row: a row back = this caller won the send; null = the guard was
+   * already set (or the order is gone). Single statement — safe under Neon's
+   * one-prepared-statement HTTP driver.
+   */
+  async claimOrderConfirmation(orderId: string): Promise<CustomOrder | null> {
+    await this.init();
+    const rows = await sql()`
+      UPDATE td_custom_orders
+      SET confirmation_sent_at = now()
+      WHERE id = ${orderId} AND confirmation_sent_at IS NULL
+      RETURNING id, artwork_url, garment, notes, customer_email,
+                fee_cents, status, created_at, shipping, confirmation_sent_at
+    `;
+    return rows.length ? rowToOrder(rows[0]) : null;
+  },
+
+  /**
+   * Phase 5c double-send guard for the production-started email. Atomically
+   * sets production_notified_at only when it is still NULL and returns the
+   * affected row: a row back = this caller won the send; null = the guard was
+   * already set (or the row is gone). Single statement.
+   */
+  async claimProductionNotification(orderId: string): Promise<FulfillmentItem | null> {
+    await this.init();
+    const rows = await sql()`
+      UPDATE td_fulfillment
+      SET production_notified_at = now()
+      WHERE order_id = ${orderId} AND production_notified_at IS NULL
+      RETURNING order_id, type, garment, artwork_url, customer_email,
+                fee_cents, status, queued_at, printful_order_id,
+                printful_status, fulfilled_at, production_notified_at,
+                production_notify_result
+    `;
+    return rows.length ? rowToFulfillment(rows[0]) : null;
+  },
+
+  /**
+   * Phase 5c: stamp the short mailer outcome ("sent" / short reason) on the
+   * fulfillment row for the owner panel. Guard-stamp stays untouched — this
+   * only records what the single send attempt returned.
+   */
+  async setProductionNotifyResult(orderId: string, result: string): Promise<void> {
+    await this.init();
+    await sql()`
+      UPDATE td_fulfillment
+      SET production_notify_result = ${result.slice(0, 120)}
+      WHERE order_id = ${orderId}
+    `;
   },
 
   // ---------- phase 5a mockup cache ----------
@@ -898,6 +1007,13 @@ function rowToOrder(r: AnyRow): CustomOrder {
     status: "submitted",
     createdAt:
       r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+    // Phase 5c double-send guard (null = never attempted).
+    confirmationSentAt:
+      r.confirmation_sent_at instanceof Date
+        ? r.confirmation_sent_at.toISOString()
+        : r.confirmation_sent_at
+          ? String(r.confirmation_sent_at)
+          : null,
     ...(shipping ? { shipping } : {}),
   };
 }
@@ -918,6 +1034,16 @@ function rowToFulfillment(r: AnyRow): FulfillmentItem {
     status: r.status === "sent_to_printful" ? "sent_to_printful" : "queued",
     queuedAt:
       r.queued_at instanceof Date ? r.queued_at.toISOString() : String(r.queued_at),
+    // Phase 5c double-send guard (null = never attempted).
+    productionNotifiedAt:
+      r.production_notified_at instanceof Date
+        ? r.production_notified_at.toISOString()
+        : r.production_notified_at
+          ? String(r.production_notified_at)
+          : null,
+    // Phase 5c short mailer outcome ("sent" / short reason, null = n/a).
+    productionNotifyResult:
+      r.production_notify_result == null ? null : String(r.production_notify_result),
     ...(hasPrintful
       ? {
           printful: {
@@ -1045,6 +1171,23 @@ export const store = {
     usePostgres()
       ? pgAdapter.updateFulfillmentStatus(orderId, update)
       : fileAdapter.updateFulfillmentStatus(orderId, update),
+  /**
+   * Phase 5c email double-send guards. Atomic claim: a row back = this caller
+   * won the send; null = already claimed (or record gone).
+   */
+  claimOrderConfirmation: (orderId: string) =>
+    usePostgres()
+      ? pgAdapter.claimOrderConfirmation(orderId)
+      : fileAdapter.claimOrderConfirmation(orderId),
+  claimProductionNotification: (orderId: string) =>
+    usePostgres()
+      ? pgAdapter.claimProductionNotification(orderId)
+      : fileAdapter.claimProductionNotification(orderId),
+  /** Phase 5c: stamp the short mailer outcome for the owner panel. */
+  setProductionNotifyResult: (orderId: string, result: string) =>
+    usePostgres()
+      ? pgAdapter.setProductionNotifyResult(orderId, result)
+      : fileAdapter.setProductionNotifyResult(orderId, result),
   // ---------- phase 5a mockup cache ----------
   /** Cached mockup row for a design URL + garment (null = miss). */
   getMockup: (designUrl: string, garment: Garment) =>
