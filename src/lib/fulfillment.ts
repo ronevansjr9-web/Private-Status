@@ -35,7 +35,12 @@ export async function queueSubmittedCustomOrders(): Promise<{
 }> {
   const orderIds = await findQueueableOrders();
   if (orderIds.length === 0) {
-    return { queued: 0, queuedAt: new Date().toISOString(), items: [] };
+    return {
+      queued: 0,
+      queuedAt: new Date().toISOString(),
+      items: [],
+      emails: [],
+    };
   }
   const created = await store.createFulfillmentItems(
     orderIds.map((o) => ({
