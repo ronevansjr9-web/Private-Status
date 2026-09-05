@@ -749,6 +749,58 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
         });
       }
 
+      // GET /api/owner/config/knock — phase 5d: which Knock credentials are
+      // set. Booleans only — the values never leave the server.
+      if (req.method === "GET" && pathname === "/api/owner/config/knock") {
+        const [apiKey, signingKey] = await Promise.all([
+          store.getConfig(CONFIG_KEYS.knockApiKey),
+          store.getConfig(CONFIG_KEYS.knockSigningKey),
+        ]);
+        return json(200, {
+          apiKeySet: Boolean(apiKey && apiKey.trim()),
+          signingKeySet: Boolean(signingKey && signingKey.trim()),
+        });
+      }
+      // POST /api/owner/config/knock — phase 5d: the owner pastes Knock
+      // credentials from their dashboard. Either value may be provided;
+      // provided values are upserted via the config store so the LIVE
+      // deployment picks them up without env injection or a redeploy (the
+      // mailer resolves env first, then this store). Responses carry
+      // set/unset booleans only — never the values.
+      if (req.method === "POST" && pathname === "/api/owner/config/knock") {
+        if (!body) return json(400, { error: "Request body is required" });
+        const b = body as Record<string, unknown>;
+        const apiKey = typeof b.apiKey === "string" ? b.apiKey.trim() : "";
+        const signingKey =
+          typeof b.signingKey === "string" ? b.signingKey.trim() : "";
+        if (!apiKey && !signingKey) {
+          return json(400, {
+            error:
+              "Provide apiKey or signingKey (from your Knock dashboard → Developers).",
+          });
+        }
+        // Sanity caps — a Knock secret key is ~100 chars, a signing key a few
+        // KB. Anything past this is a paste accident, not a credential.
+        if (apiKey.length > 200 || signingKey.length > 10_000) {
+          return json(400, { error: "That value is too long to be a Knock key." });
+        }
+        if (apiKey) await store.setConfig(CONFIG_KEYS.knockApiKey, apiKey);
+        if (signingKey) {
+          await store.setConfig(CONFIG_KEYS.knockSigningKey, signingKey);
+        }
+        // Re-read so the response reports the store's actual state (the key
+        // NOT provided keeps its previously stored value).
+        const [nowApiKey, nowSigningKey] = await Promise.all([
+          store.getConfig(CONFIG_KEYS.knockApiKey),
+          store.getConfig(CONFIG_KEYS.knockSigningKey),
+        ]);
+        return json(200, {
+          ok: true,
+          apiKeySet: Boolean(nowApiKey && nowApiKey.trim()),
+          signingKeySet: Boolean(nowSigningKey && nowSigningKey.trim()),
+        });
+      }
+
       // POST /api/owner/fulfillment/sync - phase 4b status sync. For every
       // sent_to_printful row, GET /orders/{printfulOrderId} and refresh the
       // stored printful_status. Rows already in a final state are skipped

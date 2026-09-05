@@ -365,6 +365,166 @@ function OwnerPage() {
   );
 }
 
+// Shared panel styles (also used by the Knock settings card below).
+const panelCls =
+  "rounded-2xl border border-neutral-200 bg-white p-5 shadow-sm sm:p-6";
+const labelCls =
+  "block text-xs font-bold uppercase tracking-widest text-neutral-500";
+const inputCls =
+  "mt-2 w-full rounded-xl border border-neutral-300 px-4 py-3 text-base";
+
+/**
+ * Phase 5d — "Email delivery (Knock)" card. Lets the owner paste their Knock
+ * credentials (dashboard → Developers) straight into the live deployment via
+ * POST /api/owner/config/knock; GET reports only which keys are set. Values
+ * are password-type inputs, never echoed back, never logged. This is what
+ * turns on login-code and order emails on the published site without any env
+ * injection.
+ */
+function KnockCard({ ownerKey }: { ownerKey: string }) {
+  const [apiKeySet, setApiKeySet] = useState<boolean | null>(null);
+  const [signingKeySet, setSigningKeySet] = useState<boolean | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [signingKey, setSigningKey] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/owner/config/knock", { headers: { "X-Owner-Key": ownerKey } })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(String(res.status));
+        const data = (await res.json()) as {
+          apiKeySet?: boolean;
+          signingKeySet?: boolean;
+        };
+        if (!cancelled) {
+          setApiKeySet(Boolean(data.apiKeySet));
+          setSigningKeySet(Boolean(data.signingKeySet));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setError("Could not load Knock settings.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ownerKey]);
+
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault();
+    setSavedMsg(null);
+    setError(null);
+    if (!apiKey.trim() && !signingKey.trim()) {
+      setError("Paste at least one value first.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await fetch("/api/owner/config/knock", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Owner-Key": ownerKey },
+        body: JSON.stringify({
+          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+          ...(signingKey.trim() ? { signingKey: signingKey.trim() } : {}),
+        }),
+      });
+      const data = (await res.json().catch(() => null)) as
+        | { ok?: boolean; apiKeySet?: boolean; signingKeySet?: boolean; error?: string }
+        | null;
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error ?? `Save failed (${res.status}).`);
+      }
+      setApiKeySet(Boolean(data.apiKeySet));
+      setSigningKeySet(Boolean(data.signingKeySet));
+      setApiKey("");
+      setSigningKey("");
+      setSavedMsg("Saved — login codes and order emails use these now.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Save failed.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const dot = (set: boolean | null) =>
+    set === null ? "…" : set ? "set" : "not set";
+  const dotCls = (set: boolean | null) =>
+    set === null
+      ? "bg-neutral-200 text-neutral-500"
+      : set
+        ? "bg-green-100 text-green-800"
+        : "bg-neutral-100 text-neutral-500";
+
+  return (
+    <section className={panelCls} aria-label="Email delivery (Knock)">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-xl font-black tracking-tight">Email delivery (Knock)</h2>
+        <span className="flex items-center gap-2 text-xs text-neutral-500">
+          <span
+            className={
+              "rounded-full px-2.5 py-0.5 text-xs font-bold " + dotCls(apiKeySet)
+            }
+          >
+            API key {dot(apiKeySet)}
+          </span>
+          <span
+            className={
+              "rounded-full px-2.5 py-0.5 text-xs font-bold " + dotCls(signingKeySet)
+            }
+          >
+            Signing key {dot(signingKeySet)}
+          </span>
+        </span>
+      </div>
+      <p className="mt-1 text-sm text-neutral-500">
+        Keys come from your Knock dashboard → Developers. Deliver login codes
+        and order emails.
+      </p>
+      <form onSubmit={handleSave} className="mt-4 space-y-4">
+        <div>
+          <label htmlFor="knock-api-key" className={labelCls}>
+            Secret API key
+          </label>
+          <input
+            id="knock-api-key"
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="Paste API key"
+            autoComplete="off"
+            className={inputCls}
+          />
+        </div>
+        <div>
+          <label htmlFor="knock-signing-key" className={labelCls}>
+            Signing key
+          </label>
+          <input
+            id="knock-signing-key"
+            type="password"
+            value={signingKey}
+            onChange={(e) => setSigningKey(e.target.value)}
+            placeholder="Paste signing key"
+            autoComplete="off"
+            className={inputCls}
+          />
+        </div>
+        {error && <p className="text-sm text-red-600">{error}</p>}
+        {savedMsg && <p className="text-sm text-green-700">{savedMsg}</p>}
+        <button
+          type="submit"
+          disabled={saving}
+          className="rounded-full bg-neutral-900 px-6 py-3 text-sm font-semibold text-white disabled:opacity-40"
+        >
+          {saving ? "Saving…" : "Save Knock keys"}
+        </button>
+      </form>
+    </section>
+  );
+}
+
 function Dashboard(props: {
   ownerKey: string;
   products: Product[];
@@ -537,12 +697,6 @@ function Dashboard(props: {
     }
   }
 
-  const panel =
-    "rounded-2xl border border-neutral-200 bg-white p-5 shadow-sm sm:p-6";
-  const label =
-    "block text-xs font-bold uppercase tracking-widest text-neutral-500";
-  const input =
-    "mt-2 w-full rounded-xl border border-neutral-300 px-4 py-3 text-base";
 
   return (
     <main className="min-h-dvh bg-neutral-50 text-neutral-900">
@@ -564,7 +718,7 @@ function Dashboard(props: {
         {dataError && <p className="text-sm text-red-600">{dataError}</p>}
 
         {/* ---- Panel 1: submit a design ---- */}
-        <section className={panel} aria-label="Submit a design">
+        <section className={panelCls} aria-label="Submit a design">
           <h2 className="text-xl font-black tracking-tight">Submit a design</h2>
 
           {created ? (
@@ -615,7 +769,7 @@ function Dashboard(props: {
 
               {tab === "text" ? (
                 <div>
-                  <label htmlFor="prompt" className={label}>
+                  <label htmlFor="prompt" className={labelCls}>
                     Design prompt
                   </label>
                   <textarea
@@ -624,12 +778,12 @@ function Dashboard(props: {
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
                     placeholder='e.g. "midnight radio — stacked type with a static bar"'
-                    className={input}
+                    className={inputCls}
                   />
                 </div>
               ) : (
                 <div>
-                  <label className={label}>Artwork</label>
+                  <label className={labelCls}>Artwork</label>
                   <div
                     onDragOver={(e) => {
                       e.preventDefault();
@@ -671,7 +825,7 @@ function Dashboard(props: {
               )}
 
               <div>
-                <label htmlFor="name" className={label}>
+                <label htmlFor="name" className={labelCls}>
                   Product name {tab === "text" ? "(optional)" : ""}
                 </label>
                 <input
@@ -679,13 +833,13 @@ function Dashboard(props: {
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder={tab === "text" ? "From the prompt if empty" : "Required"}
-                  className={input}
+                  className={inputCls}
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label htmlFor="tee" className={label}>
+                  <label htmlFor="tee" className={labelCls}>
                     Tee price
                   </label>
                   <input
@@ -694,11 +848,11 @@ function Dashboard(props: {
                     value={tee}
                     onChange={(e) => setTee(e.target.value)}
                     placeholder="$28 default"
-                    className={input}
+                    className={inputCls}
                   />
                 </div>
                 <div>
-                  <label htmlFor="hoodie" className={label}>
+                  <label htmlFor="hoodie" className={labelCls}>
                     Hoodie price
                   </label>
                   <input
@@ -707,7 +861,7 @@ function Dashboard(props: {
                     value={hoodie}
                     onChange={(e) => setHoodie(e.target.value)}
                     placeholder="$48 default"
-                    className={input}
+                    className={inputCls}
                   />
                 </div>
               </div>
@@ -729,8 +883,10 @@ function Dashboard(props: {
           )}
         </section>
 
+        {/* ---- Panel 1b: email delivery (Knock) settings ---- */}
+        <KnockCard ownerKey={ownerKey} />
         {/* ---- Panel 2: store status ---- */}
-        <section className={panel} aria-label="Store status">
+        <section className={panelCls} aria-label="Store status">
           <div className="flex items-center justify-between">
             <h2 className="text-xl font-black tracking-tight">Store status</h2>
             <button
@@ -815,7 +971,7 @@ function Dashboard(props: {
         </section>
 
         {/* ---- Panel 3: fulfillment queue ---- */}
-        <section className={panel} aria-label="Fulfillment queue">
+        <section className={panelCls} aria-label="Fulfillment queue">
           <div className="flex items-center justify-between gap-3">
             <h2 className="text-xl font-black tracking-tight">
               Fulfillment queue{" "}
