@@ -105,9 +105,11 @@ async function triggerWorkflow(
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          // Knock accepts a plain email string as an inline recipient — no
-          // pre-registered Knock user object required.
-          recipients: [email],
+          // Pass recipients as explicit objects: Knock treats a plain string
+          // as a user-id (no email attached), so the email step errors out.
+          // {id, email} both = the address → email step runs clean (verified
+          // live via workflow_recipient_runs: errors 1 → 0).
+          recipients: [{ id: email, email }],
           data,
         }),
         // Emails are transactional and time-sensitive — don't hang the caller
