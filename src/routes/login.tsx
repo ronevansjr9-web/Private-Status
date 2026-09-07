@@ -52,8 +52,16 @@ function LoginPage() {
         setError("Something went wrong. Please try again.");
         return;
       }
+      // delivery:"sent" is the happy path. "unconfigured" = no Knock key yet —
+      // "coming soon" hint. Anything else is a real failed delivery attempt
+      // (knock_http_*, timeout, network_error*, store_error*) — the code still
+      // verifies, so the flow continues with an honest heads-up.
       if (data.delivery === "unconfigured") {
         setDeliveryHint("Email delivery coming soon — you can still sign in once it's live.");
+      } else if (data.delivery && data.delivery !== "sent") {
+        setDeliveryHint(
+          "The email couldn't be sent just now — the code below still works, or try again."
+        );
       }
       setStep("code");
     } catch {

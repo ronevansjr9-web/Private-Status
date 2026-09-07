@@ -446,9 +446,12 @@ export async function handleApi(req: Request): Promise<ApiResult | null> {
 
     // ---------- customer auth (phase 5b) ----------
     // POST /api/auth/request-code — {email}. Always {ok:true} on success (no
-    // account enumeration). delivery:"unconfigured" means no Knock key yet —
-    // the UI shows "email delivery coming soon"; the code is still stored so
-    // the flow can be verified once delivery goes live.
+    // account enumeration). delivery:"sent" = Knock accepted the trigger;
+    // "unconfigured" = no Knock key anywhere (env + config store), the UI
+    // shows "email delivery coming soon"; ANY other value is a real failed
+    // attempt reported verbatim (knock_http_*, timeout, network_error*,
+    // store_error*) so delivery problems can never hide as "unconfigured".
+    // The code is stored either way — verify works once delivery is fixed.
     // 429 = rate limited (max 3 codes per email per 15 min).
     if (req.method === "POST" && pathname === "/api/auth/request-code") {
       let raw: Record<string, unknown>;

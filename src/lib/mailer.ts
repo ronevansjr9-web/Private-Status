@@ -67,8 +67,14 @@ export async function resolveKnockSigningKey(): Promise<string | null> {
 
 /**
  * Shared Knock trigger. One HTTP call shape for every workflow: Bearer auth,
- * {recipients:[email], data:{...}}, 10s timeout, structured result — never
- * throws, never echoes the key or the full response body upstream.
+ * {recipients:[email], data:{...}}, 10s timeout per attempt, structured result —
+ * never throws, never echoes the key or the full response body upstream.
+ *
+ * One retry on transient network-level failures (timeout / connection reset /
+ * DNS): login codes are one-shot emails and the live server has shown rare
+ * multi-second event-loop stalls where the FIRST attempt dies at exactly the
+ * 10s abort even though Knock itself answers in ~0.2s. A single retry keeps
+ * worst-case latency bounded (~20s) while rescuing those.
  */
 async function triggerWorkflow(
   workflowKey: string,
@@ -78,70 +84,101 @@ async function triggerWorkflow(
   let apiKey: string | null = null;
   try {
     apiKey = await resolveKnockApiKey();
-  } catch {
-    // Config store unavailable — treat as unconfigured.
-    return { sent: false, reason: "unconfigured" };
+  } catch (err) {
+    // Config store unavailable — NOT the same as "no key configured".
+    // Name the failure so it can never masquerade as unconfigured again.
+    const short =
+      err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 80) : "unknown";
+    console.error(`[mailer] config store failed while resolving Knock key: ${short}`);
+    return { sent: false, reason: `store_error:${short}` };
   }
   if (!apiKey) {
     return { sent: false, reason: "unconfigured" };
   }
 
-  try {
-    const res = await fetch(`${KNOCK_API_BASE}/workflows/${workflowKey}/trigger`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        // Knock accepts a plain email string as an inline recipient — no
-        // pre-registered Knock user object required.
-        recipients: [email],
-        data,
-      }),
-      // Emails are transactional and time-sensitive — don't hang the caller
-      // (a checkout/fulfillment path) on a slow API.
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!res.ok) {
-      // Known Knock error shape: { code, message, ... }; keep the status and
-      // a SHORT reason — never echo the key or full response body upstream.
-      let detail = "";
-      try {
-        const body = (await res.json()) as { message?: unknown };
-        if (body && typeof body.message === "string") detail = body.message.slice(0, 120);
-      } catch {
-        // non-JSON body — leave detail empty
-      }
-      return {
-        sent: false,
-        reason: detail
-          ? `knock_http_${res.status}: ${detail}`
-          : `knock_http_${res.status}`,
-      };
-    }
-
-    // Defensive: 2xx but unexpected body shape. Accept 200 OK with any JSON
-    // object; log nothing sensitive.
+  const attempt = async (): Promise<MailDelivery> => {
     try {
-      const body = (await res.json()) as Record<string, unknown>;
-      const runId =
-        typeof body.id === "string"
-          ? body.id
-          : typeof body.workflow_run_id === "string"
-            ? body.workflow_run_id
-            : undefined;
-      return { sent: true, ...(runId ? { runId } : {}) };
-    } catch {
-      return { sent: true };
+      const res = await fetch(`${KNOCK_API_BASE}/workflows/${workflowKey}/trigger`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          // Knock accepts a plain email string as an inline recipient — no
+          // pre-registered Knock user object required.
+          recipients: [email],
+          data,
+        }),
+        // Emails are transactional and time-sensitive — don't hang the caller
+        // (a checkout/fulfillment path) on a slow API.
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!res.ok) {
+        // Known Knock error shape: { code, message, ... }; keep the status and
+        // a SHORT reason — never echo the key or full response body upstream.
+        let detail = "";
+        try {
+          const body = (await res.json()) as { message?: unknown };
+          if (body && typeof body.message === "string") detail = body.message.slice(0, 120);
+        } catch {
+          // non-JSON body — leave detail empty
+        }
+        // An auth rejection means the RESOLVED key is bad (or revoked) — that
+        // is an operator-visible configuration problem, say so in the log.
+        if (res.status === 401 || res.status === 403) {
+          console.error(
+            `[mailer] Knock rejected the configured key for ${workflowKey} (HTTP ${res.status})`
+          );
+        }
+        return {
+          sent: false,
+          reason: detail
+            ? `knock_http_${res.status}: ${detail}`
+            : `knock_http_${res.status}`,
+        };
+      }
+
+      // Defensive: 2xx but unexpected body shape. Accept 200 OK with any JSON
+      // object; log nothing sensitive.
+      try {
+        const body = (await res.json()) as Record<string, unknown>;
+        const runId =
+          typeof body.id === "string"
+            ? body.id
+            : typeof body.workflow_run_id === "string"
+              ? body.workflow_run_id
+              : undefined;
+        return { sent: true, ...(runId ? { runId } : {}) };
+      } catch {
+        return { sent: true };
+      }
+    } catch (err) {
+      // Network failure / timeout / abort. Keep the transport class in the
+      // reason — "unconfigured" is reserved for the no-key case and must
+      // NEVER swallow a failed attempt.
+      const name = err instanceof Error ? err.name : "unknown";
+      const reason =
+        name === "TimeoutError" || name === "AbortError"
+          ? "timeout"
+          : name === "ConnectionError"
+            ? "network_error"
+            : `network_error:${name.slice(0, 40)}`;
+      console.error(`[mailer] trigger ${workflowKey} transport failure: ${reason}`);
+      return { sent: false, reason };
     }
-  } catch (err) {
-    // Network failure / timeout / abort.
-    const reason =
-      err instanceof Error && err.name === "TimeoutError" ? "timeout" : "network_error";
-    return { sent: false, reason };
+  };
+
+  const first = await attempt();
+  if (first.sent) return first;
+  // Retry exactly once, only on transport-level failures (never on Knock's
+  // own 4xx/5xx answers — those are deterministic or need an owner fix).
+  if (first.reason === "timeout" || first.reason.startsWith("network_error")) {
+    console.error(`[mailer] retrying ${workflowKey} after: ${first.reason}`);
+    return attempt();
   }
+  return first;
 }
 
 /**

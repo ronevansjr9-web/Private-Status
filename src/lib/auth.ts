@@ -32,8 +32,16 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export interface RequestCodeResult {
   ok: true;
-  /** "sent" = handed to the mailer; "unconfigured" = no Knock key yet. */
-  delivery: "sent" | "unconfigured";
+  /**
+   * "sent" = Knock accepted the workflow trigger.
+   * "unconfigured" = no Knock key anywhere (env + config store) — nothing was
+   * attempted; the UI may show "email delivery coming soon".
+   * Anything else (knock_http_*, timeout, network_error*, store_error*) = a
+   * REAL attempt failed — reported verbatim so delivery problems can never
+   * masquerade as "not configured" again. The response stays ok:true either
+   * way (no account enumeration); the code is stored and verifiable.
+   */
+  delivery: "sent" | "unconfigured" | string;
 }
 
 export interface VerifyCodeResult {
@@ -118,9 +126,14 @@ export async function requestCode(
     createdAt: now.toISOString(),
   });
   const delivery = await sendMagicCode(email, code);
+  // Report the mailer's verdict VERBATIM. Collapsing every failure into
+  // "unconfigured" is how a live timeout once hid behind "no key configured"
+  // (2026-09-06 live probe: unconfigured at exactly 10.3s = the mailer's 10s
+  // abort, next request delivered fine in 0.33s). No sensitive material can
+  // appear here: reasons are short transport/status classes, never keys.
   return {
     status: 200,
-    body: { ok: true, delivery: delivery.sent ? "sent" : "unconfigured" },
+    body: { ok: true, delivery: delivery.sent ? "sent" : (delivery.reason ?? "failed") },
   };
 }
 
