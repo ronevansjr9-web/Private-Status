@@ -75,8 +75,10 @@ const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
  *   1. POST $IMAGE_UPLOAD_PRESIGN_URL {Authorization: Bearer $IMAGE_UPLOAD_TOKEN,
  *      content-type: application/json} body {mediaType, contentType, contentLength}
  *      -> {presignedUrl, cloudfrontUrl, alreadyUploaded}
- *   2. PUT raw bytes to presignedUrl with content-type, content-length and
- *      x-amz-server-side-encryption: AES256 (signed header — omitting fails).
+ *   2. PUT raw bytes to presignedUrl with content-type + content-length.
+ *      Do NOT send x-amz-server-side-encryption: the presigner no longer signs
+ *      it, and S3 rejects unsigned headers with 403 (verified 2026-09-09 —
+ *      sending it breaks every upload).
  *   3. File is publicly served at cloudfrontUrl (~1.5s to propagate).
  *
  * Credentials resolve in order: env IMAGE_UPLOAD_* (sandbox) → config store
@@ -120,7 +122,6 @@ async function uploadImage(bytes: Uint8Array, contentType: string): Promise<stri
     headers: {
       "content-type": contentType,
       "content-length": String(bytes.byteLength),
-      "x-amz-server-side-encryption": "AES256",
     },
     body: bytes as unknown as BodyInit,
   });
