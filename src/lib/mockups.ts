@@ -42,8 +42,9 @@ const POLL_BUDGET_MS = 210_000; // ~3.5 min ceiling across the whole poll loop
  * Upload bytes via the team image service; returns the durable CloudFront URL.
  * Contract: POST $IMAGE_UPLOAD_PRESIGN_URL {Bearer $IMAGE_UPLOAD_TOKEN}
  * {mediaType, contentType, contentLength} -> {presignedUrl, cloudfrontUrl};
- * PUT raw bytes to presignedUrl with content-type + content-length +
- * x-amz-server-side-encryption: AES256 (a signed header — omitting fails).
+ * PUT raw bytes to presignedUrl with content-type + content-length only.
+ * Do NOT send x-amz-server-side-encryption: the presigner no longer signs it
+ * and S3 rejects unsigned headers with 403 (verified 2026-09-09).
  * Credentials resolve env first, then the config store (published host).
  * This mirrors the uploader in src/lib/api.ts; kept separate so that module
  * stays route-focused and this one has no HTTP-handler imports.
@@ -81,7 +82,6 @@ async function uploadImageBytes(bytes: Uint8Array, contentType: string): Promise
     headers: {
       "content-type": contentType,
       "content-length": String(bytes.byteLength),
-      "x-amz-server-side-encryption": "AES256",
     },
     body: bytes as unknown as BodyInit,
   });
